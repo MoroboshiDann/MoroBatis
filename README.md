@@ -1637,4 +1637,303 @@ public class PoolState {
 ```
 
 
+## 第六章 SQL执行器的定义
 
+在上一章节中，我们实现了池化数据源和非池化数据源，但是，与数据源以及与数据库的操作逻辑是直接写在SqlSession中的。这不利于后期扩展其他数据源，也不利于SqlSession中新增其他的CRUD方法(每一个方法都需要去直接与数据源交互)。
+
+所以，我们应该将对数据源的调用、SQL的执行和结果的处理都抽取出来，只提供一个方法入口，这样方便后期扩展和维护。
+
+### 执行器的定义和实现
+
+首先，执行器分为三部分：接口、抽象类和简单实现类。接口中，将事务操作和SQL执行的统一标准做出约束。然后，由抽象类来定义统一共用的事务操作和SQL执行流程。
+
+在具体的实现类中，完成SQL执行的具体逻辑。
+
+#### Executor
+
+```java
+public interface Executor {
+    ResultHandler NO_RESULT_HANDLER = null;
+
+    <E> List<E> query(MappedStatement ms, Object parameter, ResultHandler resultHandler, BoundSql boundSql);
+
+    Transaction getTransaction();
+
+    void commit(boolean required) throws SQLException;
+
+    void rollback(boolean required) throws SQLException;
+
+    void close(boolean forceRollback);
+}
+```
+
+#### BaseExecutor
+
+事务的操作逻辑都是一致的，所以直接在抽象类中定义。具体的SQL语句的执行逻辑是因SQL语句不同而变化的，所以放在实现在类中实现。
+
+```java
+public abstract class BaseExecutor implements Executor {
+    private org.slf4j.Logger logger = LoggerFactory.getLogger(BaseExecutor.class);
+
+    protected Configuration configuration;
+    protected Transaction transaction;
+    protected Executor wrapper;
+
+    private boolean closed;
+
+    protected BaseExecutor(Configuration configuration, Transaction transaction) {
+        this.configuration = configuration;
+        this.transaction = transaction;
+        this.wrapper = this;
+    }
+
+    @Override
+    public <E> List<E> query(MappedStatement ms, Object parameter, ResultHandler resultHandler, BoundSql boundSql) {
+        if (closed) {
+            throw new RuntimeException("Executor was closed.");
+        }
+        return doQuery(ms, parameter, resultHandler, boundSql);
+    }
+
+    protected abstract <E> List<E> doQuery(MappedStatement ms, Object parameter, ResultHandler resultHandler, BoundSql boundSql);
+
+    @Override
+    public Transaction getTransaction() {
+        if (closed) {
+            throw new RuntimeException("Executor was closed.");
+        }
+        return transaction;
+    }
+
+    @Override
+    public void commit(boolean required) throws SQLException {
+        if (closed) {
+            throw new RuntimeException("Cannot commit, transaction is already closed");
+        }
+        if (required) {
+            transaction.commit();
+        }
+    }
+
+    @Override
+    public void rollback(boolean required) throws SQLException {
+        if (!closed) {
+            if (required) {
+                transaction.rollback();
+            }
+        }
+    }
+
+    @Override
+    public void close(boolean forceRollback) {
+        try {
+            try {
+                rollback(forceRollback);
+            } finally {
+                transaction.close();
+            }
+        } catch (SQLException e) {
+            logger.warn("Unexpected exception on closing transaction.  Cause: " + e);
+        } finally {
+            transaction = null;
+            closed = true;
+        }
+    }
+}
+```
+
+#### SimpleExecutor
+
+具体的SQL执行逻辑交给执行器的实现类完成。
+
+```java
+public class SimpleExecutor extends BaseExecutor {
+    public SimpleExecutor(Configuration configuration, Transaction transaction) {
+        super(configuration, transaction);
+    }
+
+    @Override
+    protected <E> List<E> doQuery(MappedStatement ms, Object parameter, ResultHandler resultHandler, BoundSql boundSql) {
+        try {
+            Configuration configuration = ms.getConfiguration();
+            StatementHandler handler = configuration.newStatementHandler(this, ms, parameter, resultHandler, boundSql);
+            Connection connection = transaction.getConnection();
+            Statement stmt = handler.prepare(connection);
+            handler.parameterize(stmt);
+            return handler.query(stmt, resultHandler);
+        } catch (SQLException e) {
+            e.printStackTrace();
+            return null;
+        }
+    }
+}
+```
+
+### 语句处理器
+
+SQL中，是由`java.sql.Statement`实例来通过`execute(String sql)`来执行SQL语句的。因此，将实例化Statement对象、参数处理和具体执行都做出规范化约束，提取到`StatementHandler`中。然后，将通用的逻辑交给`BaseStatementHandler`来实现。其余的具体逻辑放在实现类实现。
+
+#### StatementHandler
+
+对准备Statement(实例化一个对象)、参数化和执行逻辑做出约束。
+
+```java
+public interface StatementHandler {
+    /** 准备语句 */
+    Statement prepare(Connection connection) throws SQLException;
+
+    /** 参数化 */
+    void parameterize(Statement statement) throws SQLException;
+
+    /** 执行查询 */
+    <E> List<E> query(Statement statement, ResultHandler resultHandler) throws SQLException;
+}
+```
+
+#### BaseStatementHandler
+
+这是一个抽象类，对准备Statement需要用到的引用和共有逻辑做出实现。
+
+```java
+public abstract class BaseStatementHandler implements StatementHandler {
+    protected final Configuration configuration;
+    protected final Executor executor;
+    protected final MappedStatement mappedStatement;
+
+    protected final Object parameterObject;
+    protected final ResultSetHandler resultSetHandler;
+
+    protected BoundSql boundSql;
+
+    public BaseStatementHandler(Executor executor, MappedStatement mappedStatement, Object parameterObject, ResultHandler resultHandler, BoundSql boundSql) {
+        this.configuration = mappedStatement.getConfiguration();
+        this.executor = executor;
+        this.mappedStatement = mappedStatement;
+        this.boundSql = boundSql;
+
+        this.parameterObject = parameterObject;
+        this.resultSetHandler = configuration.newResultSetHandler(executor, mappedStatement, boundSql);
+    }
+
+    @Override
+    public Statement prepare(Connection connection) throws SQLException {
+        Statement statement = null;
+        try {
+            // 实例化 Statement
+            statement = instantiateStatement(connection);
+            // 参数设置，可以被抽取，提供配置
+            statement.setQueryTimeout(350);
+            statement.setFetchSize(10000);
+            return statement;
+        } catch (Exception e) {
+            throw new RuntimeException("Error preparing statement.  Cause: " + e, e);
+        }
+    }
+
+    protected abstract Statement instantiateStatement(Connection connection) throws SQLException;
+}
+```
+
+#### PreparedStatementHandler
+
+```java
+public class PreparedStatementHandler extends BaseStatementHandler{
+    public PreparedStatementHandler(Executor executor, MappedStatement mappedStatement, Object parameterObject, ResultHandler resultHandler, BoundSql boundSql) {
+        super(executor, mappedStatement, parameterObject, resultHandler, boundSql);
+    }
+
+    @Override
+    protected Statement instantiateStatement(Connection connection) throws SQLException {
+        String sql = boundSql.getSql();
+        return connection.prepareStatement(sql);
+    }
+
+    @Override
+    public void parameterize(Statement statement) throws SQLException {
+        PreparedStatement ps = (PreparedStatement) statement;
+        ps.setLong(1, Long.parseLong(((Object[]) parameterObject)[0].toString()));
+    }
+
+    @Override
+    public <E> List<E> query(Statement statement, ResultHandler resultHandler) throws SQLException {
+        PreparedStatement ps = (PreparedStatement) statement;
+        ps.execute();
+        return resultSetHandler.<E> handleResultSets(ps);
+    }
+}
+```
+
+### 执行器的创见与使用
+
+#### 执行器的创建
+
+我们一开始就将程序与数据库的一次交互封装为一个SqlSession。于是，在实例化SqlSession对象时就要为其实例化一个执行器。于是将这部分逻辑放在工厂中。
+
+```java
+public class DefaultSqlSessionFactory implements SqlSessionFactory {
+    private final Configuration configuration;
+
+    public DefaultSqlSessionFactory(Configuration configuration) {
+        this.configuration = configuration;
+    }
+
+    @Override
+    public SqlSession openSession() {
+        Transaction tx = null;
+        try {
+            final Environment environment = configuration.getEnvironment();
+            TransactionFactory transactionFactory = environment.getTransactionFactory();
+            tx = transactionFactory.newTransaction(configuration.getEnvironment().getDataSource(), TransactionIsolationLevel.READ_COMMITTED, false);
+            // 创建执行器
+            final Executor executor = configuration.newExecutor(tx);
+            // 创建DefaultSqlSession
+            return new DefaultSqlSession(configuration, executor);
+        } catch (Exception e) {
+            try {
+                assert tx != null;
+                tx.close();
+            } catch (SQLException ignore) {
+            }
+            throw new RuntimeException("Error opening session.  Cause: " + e);
+        }
+    }
+}
+```
+
+#### 执行器使用
+
+有了执行器，SqlSession中的CRUD就可以直接调用Executor中的方法，从而实现解耦。
+
+```java
+public class DefaultSqlSession implements SqlSession {
+    private Configuration configuration;
+    private Executor executor;
+
+    public DefaultSqlSession(Configuration configuration, Executor executor) {
+        this.configuration = configuration;
+        this.executor = executor;
+    }
+
+    @Override
+    public <T> T selectOne(String statement) {
+        return this.selectOne(statement, null);
+    }
+
+    @Override
+    public <T> T selectOne(String statement, Object parameter) {
+        MappedStatement ms = configuration.getMappedStatement(statement);
+        List<T> list = executor.query(ms, parameter, Executor.NO_RESULT_HANDLER, ms.getBoundSql());
+        return list.get(0);
+    }
+
+    @Override
+    public <T> T getMapper(Class<T> type) {
+        return configuration.getMapper(type, this);
+    }
+
+    @Override
+    public Configuration getConfiguration() {
+        return configuration;
+    }
+}
+```
