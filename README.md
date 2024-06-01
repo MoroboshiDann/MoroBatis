@@ -1643,6 +1643,10 @@ public class PoolState {
 
 所以，我们应该将对数据源的调用、SQL的执行和结果的处理都抽取出来，只提供一个方法入口，这样方便后期扩展和维护。
 
+主要分为两部分：执行器和语句处理器
+- 执行器负责具体的执行逻辑。
+- 语句处理器负责将SQL语句的处理，如传参操作等。
+
 ### 执行器的定义和实现
 
 首先，执行器分为三部分：接口、抽象类和简单实现类。接口中，将事务操作和SQL执行的统一标准做出约束。然后，由抽象类来定义统一共用的事务操作和SQL执行流程。
@@ -1863,7 +1867,7 @@ public class PreparedStatementHandler extends BaseStatementHandler{
 }
 ```
 
-### 执行器的创见与使用
+### 执行器的创建与使用
 
 #### 执行器的创建
 
@@ -1937,3 +1941,562 @@ public class DefaultSqlSession implements SqlSession {
     }
 }
 ```
+
+## 第七章 将反射运用到出神入化
+
+观察实例化数据源时，对于相关属性采用的硬编码的方式读取，如果后期需要拓展字段，添加新的属性，这样做就很不利。
+
+本章节的做法是，根据需要反射填充的对象`originalObject`生成一个元对象`MetaObject`。在元对象中进行拆解解析，将对象所属的类，对象的属性字段，对象的方法都拆解出来。
+
+然后，在XMLConfigBuilder解析`<environment>`标签时，根据读取出来的属性字段，利用元对象，将这些字段填充进dataSource对象中。这样就不需要在DataSource类中以硬编码的方式定义这些属性值。后期即便有新的字段出现，只需要在XML文件中给出，就能够自动填充进对象中。
+
+
+## 第八章 细化XML语句构造器，完善静态SQL解析
+
+本章节，将从解析XML文件到解析SQL语句的功能分为三部分：解析XML文件加载数据源信息、解析XML文件生成代理Mapper对象、解析SQL语句。
+
+其中，解析SQL语句又可以进行细分：解析SQL基本信息(参数类型、返回值类型、命令类型)、解析SQL语句的内容(静态文本、动态标签)。解析基本信息的功能放在`XMLStatementBuilder`来实现。解析SQL语句内容的功能交给`LanguageDriver`语言驱动来实现。
+
+LanguageDriver的主要功能就是解析SQL语句内容，返回一个SqlSource对象。其依赖于`XMLScriptBuilder`脚本构建器，
+
+> SqlSource对应的是一整个SQL语句，SqlNode对应的是一个动态标签。
+> SqlSource的实现类包括：StaticSqlSource静态SQL语句、RawSqlSource动态SQL语句。
+> SqlNode的实现类包括：StaticTextSqlNode静态SQL节点、MixedSqlNode动态SQL节点。后者是将所有的SqlNode放在一个List集合中。
+> SqlNode需要实现一个`apply()`方法，而MixedSqlNode直接将内部的所有Node都调用自己的`apply()`。通过阅读源码发现，每个Node都是StaticTextSqlNode，其`apply()`方法就是调用`DynamicContext#appednSql`来将字符串拼接起来。
+
+
+
+在之前的做法中，我们在XMLConfigBuilder中先执行`XMLConfigBuilder#environmentsElement`方法，解析环境信息。然后，根据`<mappers>`标签中指定的`Mapper.XML`文件的包路径，一一解析分析其中的SQL语句。这样将所有的处理逻辑都放在同一个循环中进行，十分耦合，且随着内容的增多会越来越臃肿。
+
+我们现在应该将这些功能分开。首先，一个`datasource.xml`文件中主要存放的是数据源的基本信息，以及指定多个`Mapper.xml`文件的包路径。一个`Mapper.xml`文件中，有一个`<mapper>`标签作为根元素，标签内有一个属性`namespace`是唯一的，标签内包含多个SQL语句。
+
+于是，我们按照功能来讲执行逻辑划分为三部分：
+- `XMLConfigBuilder`负责解析数据源环境，并调用`XMLMapperBuilder`。
+- `XMLMapperBuilder`负责解析一个`Mapper.xml`文件，记录命名空间，并调用`XMLStatementBuilder`。
+- `XMLStatementBuilder`负责解析一条SQL语句，包括ID、参数类型、返回值类型等。
+
+
+### 解耦映射解析
+
+#### XMLConfigBuilder
+
+负责解析`datasource.xml`文件。根元素为`<configuration>`标签。通过入口I/O的方式给定XML文件的路径。
+
+核心逻辑为读取`<environments>`标签，解析数据源的配置。并根据`<mappers>`标签中指定的所有的`Mapper.xml`文件的包路径，一一创建`XMLMapperBuilder`对象，对其处理。
+
+```java
+public class XMLConfigBuilder extends BaseBuilder {
+    private Element root;
+    public XMLConfigBuilder(Reader reader) {
+        // 1. 调用父类初始化Configuration
+        super(new Configuration());
+        // 2. dom4j 处理 xml
+        SAXReader saxReader = new SAXReader();
+        try {
+            Document document = saxReader.read(new InputSource(reader));
+            root = document.getRootElement();
+        } catch (DocumentException e) {
+            e.printStackTrace();
+        }
+    }
+
+    /**
+     * 解析配置；类型别名、插件、对象工厂、对象包装工厂、设置、环境、类型转换、映射器
+     *
+     * @return Configuration
+     */
+    public Configuration parse() {
+        try {
+            // 环境
+            environmentsElement(root.element("environments"));
+            // 解析映射器
+            mapperElement(root.element("mappers"));
+        } catch (Exception e) {
+            throw new RuntimeException("Error parsing SQL Mapper Configuration. Cause: " + e, e);
+        }
+        return configuration;
+    }
+
+    /**
+     * <environments default="development">
+     * <environment id="development">
+     * <transactionManager type="JDBC">
+     * <property name="..." value="..."/>
+     * </transactionManager>
+     * <dataSource type="POOLED">
+     * <property name="driver" value="${driver}"/>
+     * <property name="url" value="${url}"/>
+     * <property name="username" value="${username}"/>
+     * <property name="password" value="${password}"/>
+     * </dataSource>
+     * </environment>
+     * </environments>
+     */
+    private void environmentsElement(Element context) throws Exception {
+        String environment = context.attributeValue("default");
+        List<Element> environmentList = context.elements("environment");
+        for (Element e : environmentList) {
+            String id = e.attributeValue("id");
+            if (environment.equals(id)) {
+                // 事务管理器
+                TransactionFactory txFactory = (TransactionFactory) typeAliasRegistry.resolveAlias(e.element("transactionManager").attributeValue("type")).newInstance();
+                // 数据源
+                Element dataSourceElement = e.element("dataSource");
+                DataSourceFactory dataSourceFactory = (DataSourceFactory) typeAliasRegistry.resolveAlias(dataSourceElement.attributeValue("type")).newInstance();
+                List<Element> propertyList = dataSourceElement.elements("property");
+                Properties props = new Properties();
+                for (Element property : propertyList) {
+                    props.setProperty(property.attributeValue("name"), property.attributeValue("value"));
+                }
+                dataSourceFactory.setProperties(props);
+                DataSource dataSource = dataSourceFactory.getDataSource();
+                // 构建环境
+                Environment.Builder environmentBuilder = new Environment.Builder(id)
+                        .transactionFactory(txFactory)
+                        .dataSource(dataSource);
+                configuration.setEnvironment(environmentBuilder.build());
+            }
+        }
+    }
+    /*
+     * <mappers>
+     *	 <mapper resource="org/mybatis/builder/AuthorMapper.xml"/>
+     *	 <mapper resource="org/mybatis/builder/BlogMapper.xml"/>
+     *	 <mapper resource="org/mybatis/builder/PostMapper.xml"/>
+     * </mappers>
+     */
+    private void mapperElement(Element mappers) throws Exception {
+        List<Element> mapperList = mappers.elements("mapper");
+        for (Element e : mapperList) {
+            String resource = e.attributeValue("resource"); 
+            InputStream inputStream = Resources.getResourceAsStream(resource);
+            // 在for循环里每个mapper都重新new一个XMLMapperBuilder，来解析
+            XMLMapperBuilder mapperParser = new XMLMapperBuilder(inputStream, configuration, resource);
+            mapperParser.parse();
+        }
+    }
+}
+```
+
+#### XMLMapperBuilder
+
+负责解析`Mapper.xml`文件。根元素为`<mapper>`标签。通过入口I/O的方式指定需要解析的文件。
+
+核心逻辑为：首先，根据当前文件的包路径`resource`检查当前文件是否已经解析过(存储在Configuration中)。然后，记录namespace。最后，为每一个SQL语句实例化一个`XMLStatementBuilder`进行解析。
+
+```java
+public class XMLMapperBuilder extends BaseBuilder {
+    private Element element;
+    private String resource;
+    private String currentNamespace;
+
+    public XMLMapperBuilder(InputStream inputStream, Configuration configuration, String resource) throws DocumentException {
+        this(new SAXReader().read(inputStream), configuration, resource);
+    }
+
+    private XMLMapperBuilder(Document document, Configuration configuration, String resource) {
+        super(configuration);
+        this.element = document.getRootElement();
+        this.resource = resource;
+    }
+    /**
+     * 解析
+     */
+    public void parse() throws Exception {
+        // 如果当前资源没有加载过再加载，防止重复加载
+        if (!configuration.isResourceLoaded(resource)) {
+            configurationElement(element);
+            // 标记一下，已经加载过了
+            configuration.addLoadedResource(resource);
+            // 绑定映射器到namespace
+            configuration.addMapper(Resources.classForName(currentNamespace));
+        }
+    }
+    // 配置mapper元素
+    // <mapper namespace="org.mybatis.example.BlogMapper">
+    //   <select id="selectBlog" parameterType="int" resultType="Blog">
+    //    select * from Blog where id = #{id}
+    //   </select>
+    // </mapper>
+    private void configurationElement(Element element) {
+        // 1.配置namespace
+        currentNamespace = element.attributeValue("namespace");
+        if (currentNamespace.equals("")) {
+            throw new RuntimeException("Mapper's namespace cannot be empty");
+        }
+        // 2.配置select|insert|update|delete
+        buildStatementFromContext(element.elements("select"));
+    }
+    // 配置select|insert|update|delete
+    private void buildStatementFromContext(List<Element> list) {
+        for (Element element : list) {
+            final XMLStatementBuilder statementParser = new XMLStatementBuilder(configuration, element, currentNamespace);
+            statementParser.parseStatementNode();
+        }
+    }
+}
+```
+
+#### XMLStatementBuilder
+
+负责解析一条SQL语句。根元素为`<select>`等标签。
+
+核心逻辑为：解析SQL语句的ID、参数类型、返回值类型，并将后两者的类型映射为具体的Java类型。然后，获取一个语言驱动器实例`LanguageDriver`，在其内部解析SQL语句的内容，获得一个`SqlSource`实例。将SqlSource同ID、参数类型、返回值类型等信息封装到MappedStatement实例中，记录在Configuration里。
+
+```java
+public class XMLStatementBuilder extends BaseBuilder {
+    private String currentNamespace;
+    private Element element;
+
+    public XMLStatementBuilder(Configuration configuration, Element element, String currentNamespace) {
+        super(configuration);
+        this.element = element;
+        this.currentNamespace = currentNamespace;
+    }
+    // 解析语句(select|insert|update|delete)
+    // <select id="selectPerson" parameterType="int" parameterMap="deprecated" resultType="hashmap" resultMap="personResultMap" flushCache="false" useCache="true" timeout="10000" fetchSize="256" statementType="PREPARED" resultSetType="FORWARD_ONLY"> 
+    // SELECT * FROM PERSON WHERE ID = #{id} 
+    // </select>
+    public void parseStatementNode() {
+        String id = element.attributeValue("id");
+        // 参数类型
+        String parameterType = element.attributeValue("parameterType");
+        Class<?> parameterTypeClass = resolveAlias(parameterType);
+        // 结果类型
+        String resultType = element.attributeValue("resultType");
+        Class<?> resultTypeClass = resolveAlias(resultType);
+        // 获取命令类型(select|insert|update|delete)
+        String nodeName = element.getName();
+        SqlCommandType sqlCommandType = SqlCommandType.valueOf(nodeName.toUpperCase(Locale.ENGLISH));
+        // 获取默认语言驱动器
+        Class<?> langClass = configuration.getLanguageRegistry().getDefaultDriverClass();
+        LanguageDriver langDriver = configuration.getLanguageRegistry().getDriver(langClass);
+
+        SqlSource sqlSource = langDriver.createSqlSource(configuration, element, parameterTypeClass);
+
+        MappedStatement mappedStatement = new MappedStatement.Builder(configuration, currentNamespace + "." + id, sqlCommandType, sqlSource, resultTypeClass).build();
+        // 添加解析 SQL
+        configuration.addMappedStatement(mappedStatement);
+    }
+}
+```
+
+### 脚本语言驱动
+
+上文中的XMLStatementBuilder只负责记录SQL语句的基本信息，具体的解析过程放在了语言驱动中实现。
+
+XMLStatementBuilder中，对于当前的SQL语句，调用了`LanguageDriver#createSqlSource`方法，获取了一个SqlSource对象。
+
+而我们实现的语言驱动器为XMLLanguageDriver，它直接封装了XMLScriptBuilder来完成该功能。
+
+XMLScriptBuilder先将SQL语句中的所有标签都各自封装进一个StaticTextSqlNode对象，然后用List集合封装进MixedSqlNode对象。
+
+再用MixedSqlNode生一个RawSqlSource对象。在RawSqlSource构造器中，就会实例化一个DynamicContext对象，将MixedSqlNode中的标签拼接起来转换为SQL字符串。
+
+然后，实例化一个SqlSourceBuilder对象，负责将SQL字符串中`#{}`等占位符表示的参数的符号引用替换为真实引用，并将结果封装进SqlSource返回。
+
+至此，一条SQL语句从XML中的定义解析为一个SqlSource对象的过程就完成了。
+
+#### LanguageDriver
+
+首先，对语言驱动接口给出定义。语言驱动的功能就是根据给定的参数和XML标签，生成SQL语句源代码对象。
+
+```java
+public interface LanguageDriver {
+    SqlSource createSqlSource(Configuration configuration, Element script, Class<?> parameterType);
+}
+```
+
+#### XMLLanguageDriver
+
+语言驱动器的实现类，封装XMLScriptBuilder对语句的处理。
+
+```java
+public class XMLLanguageDriver implements LanguageDriver {
+    @Override
+    public SqlSource createSqlSource(Configuration configuration, Element script, Class<?> parameterType) {
+        XMLScriptBuilder builder = new XMLScriptBuilder(configuration, script, parameterType);
+        return builder.parseScriptNode();
+    }
+}
+```
+
+#### XMLScriptBuilder脚本构建器
+
+核心功能为为一条SQL语句生成一个SqlSource实例对象。生成过程需要用到SQL源码构建器`SqlSourceBuilder`。
+
+具体逻辑为：
+- 先将所有的SQL标签(if、where等)，都各自封装进一个StaticTextSqlNode对象中，并用List集合存储。
+- 然后，将List集合封装进一个MixedSqlNode对象。
+- 再利用，MixedSqlNode去构建一个RawSqlSource对象，并返回。
+- RawSqlSource的构建过程放在其章节描述。
+
+```java
+public class XMLScriptBuilder extends BaseBuilder {
+    private Element element;
+    private boolean isDynamic;
+    private Class<?> parameterType;
+
+    public XMLScriptBuilder(Configuration configuration, Element element, Class<?> parameterType) {
+        super(configuration);
+        this.element = element;
+        this.parameterType = parameterType;
+    }
+
+    public SqlSource parseScriptNode() {
+        List<SqlNode> contents = parseDynamicTags(element);
+        MixedSqlNode rootSqlNode = new MixedSqlNode(contents);
+        return new RawSqlSource(configuration, rootSqlNode, parameterType);
+    }
+
+    List<SqlNode> parseDynamicTags(Element element) {
+        List<SqlNode> contents = new ArrayList<>();
+        // element.getText 拿到 SQL
+        String data = element.getText();
+        contents.add(new StaticTextSqlNode(data));
+        return contents;
+    }
+}
+```
+
+#### 语言驱动器注册
+
+负责维护一个驱动器容器其，内部保持系统中语言驱动器的实例对象。需要用到时直接调用，不需要反复创建。
+
+```java
+public class LanguageDriverRegistry {
+
+    // map
+    private final Map<Class<?>, LanguageDriver> LANGUAGE_DRIVER_MAP = new HashMap<Class<?>, LanguageDriver>();
+
+    private Class<?> defaultDriverClass = null;
+
+    public void register(Class<?> cls) {
+        if (cls == null) {
+            throw new IllegalArgumentException("null is not a valid Language Driver");
+        }
+        if (!LanguageDriver.class.isAssignableFrom(cls)) {
+            throw new RuntimeException(cls.getName() + " does not implements " + LanguageDriver.class.getName());
+        }
+        // 如果没注册过，再去注册
+        LanguageDriver driver = LANGUAGE_DRIVER_MAP.get(cls);
+        if (driver == null) {
+            try {
+                //单例模式，即一个Class只有一个对应的LanguageDriver
+                driver = (LanguageDriver) cls.newInstance();
+                LANGUAGE_DRIVER_MAP.put(cls, driver);
+            } catch (Exception ex) {
+                throw new RuntimeException("Failed to load language driver for " + cls.getName(), ex);
+            }
+        }
+    }
+
+    public LanguageDriver getDriver(Class<?> cls) {
+        return LANGUAGE_DRIVER_MAP.get(cls);
+    }
+
+    public LanguageDriver getDefaultDriver() {
+        return getDriver(getDefaultDriverClass());
+    }
+
+    public Class<?> getDefaultDriverClass() {
+        return defaultDriverClass;
+    }
+
+    //Configuration()有调用，默认的为XMLLanguageDriver
+    public void setDefaultDriverClass(Class<?> defaultDriverClass) {
+        register(defaultDriverClass);
+        this.defaultDriverClass = defaultDriverClass;
+    }
+
+}
+```
+
+### SQL源码构建器
+
+#### RawSqlSource
+
+SqlSource的实现类(SqlSource共有两种实现类StaticSqlSource对应没有参数的静态SQL，以及RawSqlSource对应有传入参数的动态SQL)。最终所有的SQL语句都会转换为一个StaticSqlSource对象。
+
+构建RawSqlSource需要一个SqlNode实例对象，即将XML文件中的SQL语句内部标签(if、where)等都封装为对象。其构造逻辑如下：
+- 在构造方法中，会实例化一个DynamicContext对象，对所有的SqlNode调用其`SqlNode#apply`方法，将它们都转换为字符串拼接起来，得到一个SQL字符串。
+- 然后，实例化一个SqlSourceBuilder对象，调用其`parse()`方法，返回一个SqlSource对象，记录在当前RawSqlSource内部。
+
+```java
+public class RawSqlSource implements SqlSource {
+    private final SqlSource sqlSource;
+
+    public RawSqlSource(Configuration configuration, SqlNode rootSqlNode, Class<?> parameterType) {
+        this(configuration, getSql(configuration, rootSqlNode), parameterType);
+    }
+
+    public RawSqlSource(Configuration configuration, String sql, Class<?> parameterType) {
+        SqlSourceBuilder sqlSourceParser = new SqlSourceBuilder(configuration);
+        Class<?> clazz = parameterType == null ? Object.class : parameterType;
+        sqlSource = sqlSourceParser.parse(sql, clazz, new HashMap<>());
+    }
+
+    @Override
+    public BoundSql getBoundSql(Object parameterObject) {
+        return sqlSource.getBoundSql(parameterObject);
+    }
+
+    private static String getSql(Configuration configuration, SqlNode rootSqlNode) {
+        DynamicContext context = new DynamicContext(configuration, null);
+        rootSqlNode.apply(context);
+        return context.getSql();
+    }
+}
+```
+
+#### StaticSqlSource
+
+负责记录解析好的SQL语句，以及其参数。
+
+```java
+public class StaticSqlSource implements SqlSource {
+    private String sql;
+    private List<ParameterMapping> parameterMappings;
+    private Configuration configuration;
+
+    public StaticSqlSource(Configuration configuration, String sql) {
+        this(configuration, sql, null);
+    }
+
+    public StaticSqlSource(Configuration configuration, String sql, List<ParameterMapping> parameterMappings) {
+        this.sql = sql;
+        this.parameterMappings = parameterMappings;
+        this.configuration = configuration;
+    }
+
+    @Override
+    public BoundSql getBoundSql(Object parameterObject) {
+        return new BoundSql(configuration, sql, parameterMappings, parameterObject);
+    }
+}
+```
+
+#### SqlSourceBuilder
+
+核心功能为将SQL字符串中的`#{}, ${}`符号引用，转换为`?`站位，并记录对应位置应该填入的参数类型。将结果封装进一个StaticSqlSource对象保存。
+
+核心逻辑为：
+- 实例化一个`GenericTokenParer`对象，让其负责处理`#{}, ${}`符号引用
+- 遇到符号引用时，就会调用内部类`ParameterMappingTokenHandler#handleToken`方法，将其替换为`?`并记录参数类型，按顺序记录在List集合中。
+
+```java
+public class SqlSourceBuilder extends BaseBuilder {
+    private static final String parameterProperties = "javaType,jdbcType,mode,numericScale,resultMap,typeHandler,jdbcTypeName";
+
+    public SqlSourceBuilder(Configuration configuration) {
+        super(configuration);
+    }
+
+    public SqlSource parse(String originalSql, Class<?> parameterType, Map<String, Object> additionalParameters) {
+        ParameterMappingTokenHandler handler = new ParameterMappingTokenHandler(configuration, parameterType, additionalParameters);
+        GenericTokenParser parser = new GenericTokenParser("#{", "}", handler);
+        String sql = parser.parse(originalSql);
+        // 返回静态 SQL
+        return new StaticSqlSource(configuration, sql, handler.getParameterMappings());
+    }
+
+    private static class ParameterMappingTokenHandler extends BaseBuilder implements TokenHandler {
+
+        private List<ParameterMapping> parameterMappings = new ArrayList<>();
+        private Class<?> parameterType;
+        private MetaObject metaParameters;
+
+        public ParameterMappingTokenHandler(Configuration configuration, Class<?> parameterType, Map<String, Object> additionalParameters) {
+            super(configuration);
+            this.parameterType = parameterType;
+            this.metaParameters = configuration.newMetaObject(additionalParameters);
+        }
+
+        public List<ParameterMapping> getParameterMappings() {
+            return parameterMappings;
+        }
+
+        @Override
+        public String handleToken(String content) {
+            parameterMappings.add(buildParameterMapping(content));
+            return "?";
+        }
+        // 构建参数映射
+        private ParameterMapping buildParameterMapping(String content) {
+            // 先解析参数映射,就是转化成一个 HashMap | #{favouriteSection,jdbcType=VARCHAR}
+            Map<String, String> propertiesMap = new ParameterExpression(content);
+            String property = propertiesMap.get("property");
+            Class<?> propertyType = parameterType;
+            ParameterMapping.Builder builder = new ParameterMapping.Builder(configuration, property, propertyType);
+            return builder.build();
+        }
+
+    }
+}
+```
+
+#### GenericTokenParser
+
+负责处理`#{}, #{}`。
+
+```java
+public class GenericTokenParser {
+    // 有一个开始和结束记号
+    private final String openToken;
+    private final String closeToken;
+    // 记号处理器
+    private final TokenHandler handler;
+
+    public GenericTokenParser(String openToken, String closeToken, TokenHandler handler) {
+        this.openToken = openToken;
+        this.closeToken = closeToken;
+        this.handler = handler;
+    }
+
+    public String parse(String text) {
+        StringBuilder builder = new StringBuilder();
+        if (text != null && text.length() > 0) {
+            char[] src = text.toCharArray();
+            int offset = 0;
+            int start = text.indexOf(openToken, offset);
+            // #{favouriteSection,jdbcType=VARCHAR}
+            // 这里是循环解析参数，参考GenericTokenParserTest,比如可以解析${first_name} ${initial} ${last_name} reporting.这样的字符串,里面有3个${}
+            while (start > -1) {
+                //判断一下 ${ 前面是否是反斜杠，这个逻辑在老版的mybatis中（如3.1.0）是没有的
+                if (start > 0 && src[start - 1] == '\\') {
+                    // the variable is escaped. remove the backslash.
+                    // 新版已经没有调用substring了，改为调用如下的offset方式，提高了效率
+                    builder.append(src, offset, start - offset - 1).append(openToken);
+                    offset = start + openToken.length();
+                } else {
+                    int end = text.indexOf(closeToken, start);
+                    if (end == -1) {
+                        builder.append(src, offset, src.length - offset);
+                        offset = src.length;
+                    } else {
+                        builder.append(src, offset, start - offset);
+                        offset = start + openToken.length();
+                        String content = new String(src, offset, end - offset);
+                        // 得到一对大括号里的字符串后，调用handler.handleToken,比如替换变量这种功能
+                        builder.append(handler.handleToken(content));
+                        offset = end + closeToken.length();
+                    }
+                }
+                start = text.indexOf(openToken, offset);
+            }
+            if (offset < src.length) {
+                builder.append(src, offset, src.length - offset);
+            }
+        }
+        return builder.toString();
+    }
+}
+```
+
+## 第九章 使用策略模式，调用参数处理器
+
+在之前的做法中，我们已经将SQL语句中动态传参的部分替换为了`?`，并在`ParameterMappings`记录了参数映射类型。在执行SQL时，会通过`StatementHandler#parameterize`方法来将占位符替换为参数。
+
+但是，这么做是通过硬编码的方式来实现的。我们需要对这一部分进行处理，将硬编码转换为自动类型处理。    
+
+
