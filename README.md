@@ -6,6 +6,53 @@ Mybatis的作用：
 
 不使用Mybatis之前，需要通过JDBC来手动连接数据库，Java代码和SQL代码耦合在一起，不利于后期修改维护。同时Mybatis免除了JDBC参数设置和获取结果集的工作。
 
+> 代码执行流程：
+> 启动阶段：
+> - XMLConfigBuilder读取`datasource.xml`，解析数据源信息。根据`<mappers>`标签给出的路径为每一个`Mapper.xml`调用XMLMapperBuilder
+>   - 在该类型的构造器中，会实例化一个`Configuration`对象，用来存储数据源和SQL相关的所有信息。一个程序只会有一个Configuration对象。
+>   - Configuration在构造器中就会实例化一个`LanguageDriver`，用于后续处理SQL语句内容。
+> - XMLMapperBuilder读取`namespace`属性，并注册Mapper。为每一个`<select>`等SQL语句标签调用XMLStatementBuilder
+>   - 注册Mapper，通过MapperRegistry提供的API，根据Dao接口的`Class`对象，注册代理工厂，生成Mapper代理对象。
+> - XMLStatementBuilder读取SQL语句的ID、入参类型、结果类型并记录。调用语言驱动器LanguageDriver来解析SQL语句具体内容，生成SqlSource对象。
+>   - LanguageDriver在Configuration对象被实例化时一起被实例化，并存储在Configuration对象中。
+>   - LanguageDriver在处理SQL语句时需要入参类型`Class<?> parameterType`，于是根据SQL标签中的`parameterType`属性，来将入参对应的Java类型Class对象加载出来。
+> - LanguageDriver为当前SQL语句实例化一个`XMLScriptBuilder`对象，调用其`parseScriptNode()`方法来处理SQL语句内容。
+> - `XMLScriptBuilder#parseScriptNode`会将SQL每一个标签(if、where等)实例化为一个`StaticTextSqlNode`对象，然后将所有静态文本节点对象存储在一个List集合中，封装到`MixedSqlNode`对象中。然后再使用混合节点对象来实例化`RawSqlSource`对象。
+> - RawSqlSource在构造器方法中，会调用`getSql()`方法。实例化一个`DynamicContext`对象，并将MixedSqlNode中所有的静态SQL作为字符串拼接起来，存储在内部。
+>   - 通过DynamicContext，RawSqlSource就获得了一个以字符串形式表示的SQL语句，其中的参数都以`#{id}, ${user.id}`的形式表示着。
+> - 接着RawSqlSource实例化一个`SqlSourceBuilder`对象，让其对SQL字符串进行处理，主要是处理参数，并返回一个`StaticSqlSource`对象。
+> - SqlSourceBuilder会实例化一个`GenericTokenParser`对象，调用其`parse()`方法来对SQL字符串的参数进行处理。
+> - 在`GenericTokenParser#parse`方法中，对于每一个以`#{}`表示的参数，会调用`ParameterMappingTokenHandler#handleToken`方法来处理。
+> - `ParameterMappingTokenHandler#handleToken`中，将当前的参数用`?`来占位，并调用`buildParameterMapping()`方法来构建参数映射。
+> - `builderParameterMapping()`方法中，将当前参数根据参数名和从一开始就传入的JavaType，转换为一个`ParameterMapping`对象。
+>   - 由于ParameterMappingTokenHandler是SqlSourceBuilder的内部类，而SqlSourceBuilder一个实例只处理一个SQL语句，所以在该类中通过List集合记录下每次调用`handleToken()`方法产生的ParameterMapping对象，就可以按照顺序存储一条SQL语句每个`?`处应该填入的变量名、JdbcType和JavaType。
+> - SqlSourceBuilder处理完一条SQL语句后，会将处理完生成的SQL语句(变量用`?`占位的语句)，以及参数映射表都封装进一个StaticSqlSource对象返回。
+> - 最终，一路返回，直到XMLStatementBuilder拿到SqlSource实例(拿到的是RawSqlSource，而其内部封装了一个StaticSqlSource对象，所以最终每一条SQL都会封装为一个StaticSqlSource对象)。
+>   - StaticSqlSource提供了`getBoundSql()`方法，会实例化一个BoundSql对象返回。相当于在运行SQL语句时，会生成一个BoundSql对象，而不是直接拿着SqlSource对象使用。
+> - XMLStatementBuilder再将SqlSource(SQL语句的本体)和解析出来的ID、语句类型、结果类型等信息一起封装到一个`MappedStatement`对象中。
+> - 至此，`datasoure.xml`和所有的`Mapper.xml`文件的扫描解析就完成了。所有的结果都存储在一个Configuration对象中。
+
+
+> 执行SQL：
+> - 程序调用`Dao#selectOne`并传入了一个Long类型参数。
+> - Mapper代理对象通过反射，拦截到了方法的执行，转而执行`MapperProxy#invoke`方法。
+> - `invoke()`方法中，先检查该方法是已经在Dao接口的某个实现类中有了实现，有了就直接调用该方法，如果没有就执行自己的逻辑。
+> - `invoke()`方法，检查当前执行方法是否已经解析生成了`MapperMethod`实例，如果没有就解析生成一个并记录。
+> - `invoke()`方法中，拿到方法对应的MapperMethod实例，调用`MapperMethod#execute`方法。
+> - `MapperMethod#execute`中，先将传入参数进行转化处理，将数组类型转化为Object(可能对应一个对象，也可能对应一个Map集合)，然后查看方法类型(select，update，delete等)，调用对应的`SqlSession#selectOne`方法。
+>   - 由于`invoke()`方法的入参为`Object[] args`数组类型，所以解析当前方法签名，将方法传入参数，记录在一个Map集合中。key为参数序号`0, 1, 2`，value为对应传入的对象。
+> - `SqlSession#selectOne`入参为SQL语句的编号和SQL语句对应参数的集合(此时参数还是Java的对象)。根据SQL编号从Configuration中拿到对应的MappedStatement对象，然后根据MS对象中封装的SqlSource生成一个BoundSql对象。最后，将MS对象、入参集合、结果处理器和BoundSql对象一起，调用`Executor#query`方法。
+> - Executor是一个接口，所以实际调用的是其实现类方法`doQuery()`。在其中，执行查询数据库的逻辑。
+> - 首先，根据方法的入参，实例化一个`StatementHandler`对象，用于处理SQL语句(此时SQL语句中的参数还是使用`?`占位符，入参也还是Java类型的)。
+>   - StatementHandler内部会实例化一个`ParameterHanlder`对象，用处处理SQL语句中的参数传入问题。
+> - 然后，通过事务打开连接Connection，并通过StatementHandler来初始化连接信息，获得一个`java.sql.Statement`对象。(JDBC基本流程)。
+> - 接着，通过`StatementHandler#parameterize`方法调用`ParameterHandler#setParameters`方法，来将`?`处的参数传入。
+>   - 在上述方法中，根据启动阶段解析出来的ParameterMapping集合，为对应位置的`?`，将Java类型的参数转换为Jdbc类型的。然后调用`TypeHandler#setParameter`方法，执行替换。
+>   - 由于在该方法中是直接遍历处理ParameterMappings集合，所以每个参数都会执行一次`setParameter()`方法。
+>   - 由于参数类型很多，所以才抽取出来一个TypeHandler接口约束功能，每个类型对应一个实现类。同时在方法调用时也能通过多态的方法节约代码量，方便后期维护。
+> - 接着回到`doQuery()`中，SQL语句中的参数已经传入，可以直接执行数据库操作。然后，将返回的结果通过ResultHandler处理，返回给调用处。
+> - 最终一路返回，`Dao#selectOne`方法拿到了从数据库查询出来的值。
+
 
 ## 第一章 创建简单的映射器代理工厂
 
@@ -423,6 +470,63 @@ public class MappedStatement {
             return mappedStatement;
         }
 
+    }
+}
+```
+
+### MappedMethod
+
+对于Dao接口中的每一个方法，其对应着一条SQL语句，为了执行方便，为每个方法都生成一个`MappedMethod`实例，用来管理SQL执行相关的操作。
+
+在`MappedMethod#execute`方法中，会根据SQL的类型来执行相应的逻辑。
+
+```java
+public class MapperMethod {
+    private final SqlCommand command;
+
+    public MapperMethod(Class<?> mapperInterface, Method method, Configuration configuration) {
+        this.command = new SqlCommand(configuration, mapperInterface, method);
+    }
+
+    public Object execute(SqlSession sqlSession, Object[] args) {
+        Object result = null;
+        switch (command.getType()) {
+            case INSERT:
+                break;
+            case DELETE:
+                break;
+            case UPDATE:
+                break;
+            case SELECT:
+                result = sqlSession.selectOne(command.getName(), args);
+                break;
+            default:
+                throw new RuntimeException("Unknown execution method for: " + command.getName());
+        }
+        return result;
+    }
+    /**
+     * SQL 指令
+     */
+    public static class SqlCommand {
+
+        private final String name;
+        private final SqlCommandType type;
+
+        public SqlCommand(Configuration configuration, Class<?> mapperInterface, Method method) {
+            String statementName = mapperInterface.getName() + "." + method.getName();
+            MappedStatement ms = configuration.getMappedStatement(statementName);
+            name = ms.getId();
+            type = ms.getSqlCommandType();
+        }
+
+        public String getName() {
+            return name;
+        }
+
+        public SqlCommandType getType() {
+            return type;
+        }
     }
 }
 ```
@@ -2353,6 +2457,8 @@ public class RawSqlSource implements SqlSource {
 
 负责记录解析好的SQL语句，以及其参数。
 
+在StaticSqlSource中以List集合的方式，按顺序记录下了传入参数的映射关系(JdbcType和JavaType)，以便于执行SQL时按照映射关系传入参数。
+
 ```java
 public class StaticSqlSource implements SqlSource {
     private String sql;
@@ -2497,6 +2603,291 @@ public class GenericTokenParser {
 
 在之前的做法中，我们已经将SQL语句中动态传参的部分替换为了`?`，并在`ParameterMappings`记录了参数映射类型。在执行SQL时，会通过`StatementHandler#parameterize`方法来将占位符替换为参数。
 
-但是，这么做是通过硬编码的方式来实现的。我们需要对这一部分进行处理，将硬编码转换为自动类型处理。    
+但是，这么做是通过硬编码的方式来实现的，比如在`PreparedStatementHandler#parameterize`中，我们直接使用`setLong()`方法来将Long类型参数传入。我们需要对这一部分进行处理，将硬编码转换为自动类型处理。因为真实情况下，参数类型有多种，不可能为每一个类型的参数重载一个方法，这样也不方便后期扩展。
 
+
+### 入参校准
+
+之前的做法中，在`MappedMethod#execute`方法中直接将代理对象`invoke()`方法的入参`args[]`传入了SqlSession的对应方法中。直接使用数组类型来进行参数映射不方便，因为我们不知道会传入几个参数。
+
+因此，我们在代理对象执行`invoke()`时，就将参数`args[]`进行处理。
+
+#### MapperMethod
+
+该类对应的是Dao接口中的一个方法，存储了方法的方法签名和对应的SQL指令的ID和类型。
+
+当程序调用`Dao#select`方法时，会通过Mapper代理对象执行`Mapper#invoke`方法。在`invoke()`内部调用该方法对应的`MapperMethod#excute`方法。在`excute()`方法内部，根据方法对应的SQL类型来执行SqlSession中的对应方法。
+
+先前的做法是直接将`invoke()`的入参`args[]`传给`SqlSession#select`。而现在，我们要先对入参进行处理，将数组类型转换为对象。
+
+首先，定义一个内部类`MethodSignature`用来解析方法签名。直接根据用户调用的Dao接口的方法签名，来解析`args[]`数组中到底应该是什么对象。
+
+使用一个``Map<String, Object>`集合来按照顺序记录数组中的对象。即集合的key为字符串`0, 1, 2, ... `，value为对应位置的参数对象。
+
+于是，在调用SqlSession具体方法时，如果入参是单个对象，直接传入该对象；如果入参是多个对象，我们传入的是一个Map集合。
+- 那么，在最终由`StatementHandler#parameterize`给SQL传入参数时，怎么知道到底接收到的参数是一个，还是多个呢。这个就需要用到ParameterHandler，TypeHandler，以及其注册机TypeHandlerRegistry。
+
+```java
+public class MapperMethod {
+    private final SqlCommand command;
+    private final MethodSignature method;
+
+    public MapperMethod(Class<?> mapperInterface, Method method, Configuration configuration) {
+        this.command = new SqlCommand(configuration, mapperInterface, method);
+        this.method = new MethodSignature(configuration, method);
+    }
+
+    public Object execute(SqlSession sqlSession, Object[] args) {
+        Object result = null;
+        switch (command.getType()) {
+            case INSERT:
+                break;
+            case DELETE:
+                break;
+            case UPDATE:
+                break;
+            case SELECT:
+                Object param = method.convertArgsToSqlCommandParam(args);
+                result = sqlSession.selectOne(command.getName(), param);
+                break;
+            default:
+                throw new RuntimeException("Unknown execution method for: " + command.getName());
+        }
+        return result;
+    }
+    /**
+     * SQL 指令
+     */
+    public static class SqlCommand {
+        private final String name;
+        private final SqlCommandType type;
+
+        public SqlCommand(Configuration configuration, Class<?> mapperInterface, Method method) {
+            String statementName = mapperInterface.getName() + "." + method.getName();
+            MappedStatement ms = configuration.getMappedStatement(statementName);
+            name = ms.getId();
+            type = ms.getSqlCommandType();
+        }
+
+        public String getName() {
+            return name;
+        }
+
+        public SqlCommandType getType() {
+            return type;
+        }
+    }
+    /**
+     * 方法签名
+     */
+    public static class MethodSignature {
+        private final SortedMap<Integer, String> params;
+
+        public MethodSignature(Configuration configuration, Method method) {
+            this.params = Collections.unmodifiableSortedMap(getParams(method));
+        }
+
+        public Object convertArgsToSqlCommandParam(Object[] args) {
+            final int paramCount = params.size();
+            if (args == null || paramCount == 0) {
+                //如果没参数
+                return null;
+            } else if (paramCount == 1) {
+                return args[params.keySet().iterator().next().intValue()];
+            } else {
+                // 否则，返回一个ParamMap，修改参数名，参数名就是其位置
+                final Map<String, Object> param = new ParamMap<Object>();
+                int i = 0;
+                for (Map.Entry<Integer, String> entry : params.entrySet()) {
+                    // 1.先加一个#{0},#{1},#{2}...参数
+                    param.put(entry.getValue(), args[entry.getKey().intValue()]);
+                    // issue #71, add param names as param1, param2...but ensure backward compatibility
+                    final String genericParamName = "param" + (i + 1);
+                    if (!param.containsKey(genericParamName)) {
+                        /*
+                         * 2.再加一个#{param1},#{param2}...参数
+                         * 你可以传递多个参数给一个映射器方法。如果你这样做了,
+                         * 默认情况下它们将会以它们在参数列表中的位置来命名,比如:#{param1},#{param2}等。
+                         * 如果你想改变参数的名称(只在多参数情况下) ,那么你可以在参数上使用@Param(“paramName”)注解。
+                         */
+                        param.put(genericParamName, args[entry.getKey()]);
+                    }
+                    i++;
+                }
+                return param;
+            }
+        }
+
+        private SortedMap<Integer, String> getParams(Method method) {
+            // 用一个TreeMap，这样就保证还是按参数的先后顺序
+            final SortedMap<Integer, String> params = new TreeMap<Integer, String>();
+            final Class<?>[] argTypes = method.getParameterTypes();
+            for (int i = 0; i < argTypes.length; i++) {
+                String paramName = String.valueOf(params.size());
+                // 不做 Param 的实现，这部分不处理。如果扩展学习，需要添加 Param 注解并做扩展实现。
+                params.put(i, paramName);
+            }
+            return params;
+        }
+    }
+    /**
+     * 参数map，静态内部类,更严格的get方法，如果没有相应的key，报错
+     */
+    public static class ParamMap<V> extends HashMap<String, V> {
+        private static final long serialVersionUID = -2212268410512043556L;
+
+        @Override
+        public V get(Object key) {
+            if (!super.containsKey(key)) {
+                throw new RuntimeException("Parameter '" + key + "' not found. Available parameters are " + keySet());
+            }
+            return super.get(key);
+        }
+    }
+}
+```
+
+### 参数策略处理器
+
+负责给SQL语句传入参数的具体逻辑。
+
+由于参数种类不同，所以我们先定义一个接口约束功能，然后再根据具体的类型给出实现类即可。
+
+#### TypeHandler
+
+通过方法签名可以看出，TypeHandler的核心功能就是：给SQL语句中第i个位置的参数，传入具体的数值。
+
+但TypHandler是一个接口，且参数类型是一个泛型，那么传入参数时具体调用哪个实现类的方法？这就需要用到一个注册机，根据JdbcType和JavaType来确定用哪个类型处理器。
+
+```java
+public interface TypeHandler<T> {
+    /**
+     * 设置参数
+     */
+    void setParameter(PreparedStatement ps, int i, T parameter, JdbcType jdbcType) throws SQLException;
+}
+```
+
+#### BaseTypeHandler
+
+抽象类，负责抽取传参的公共逻辑。
+
+```java
+public abstract class BaseTypeHandler<T> implements TypeHandler<T> {
+    protected Configuration configuration;
+
+    public void setConfiguration(Configuration configuration) {
+        this.configuration = configuration;
+    }
+
+    @Override
+    public void setParameter(PreparedStatement ps, int i, T parameter, JdbcType jdbcType) throws SQLException {
+        // 定义抽象方法，由子类实现不同类型的属性设置
+        setNonNullParameter(ps, i, parameter, jdbcType);
+    }
+
+    protected abstract void setNonNullParameter(PreparedStatement ps, int i, T parameter, JdbcType jdbcType) throws SQLException;
+}
+```
+
+#### LongTypeHandler
+
+具体的类型处理器，负责给SQL传入Long类型的数据。
+
+给SQL语句第i个参数，传入Long类型数据。
+
+```java
+public class LongTypeHandler extends BaseTypeHandler<Long> {
+    @Override
+    protected void setNonNullParameter(PreparedStatement ps, int i, Long parameter, JdbcType jdbcType) throws SQLException {
+        ps.setLong(i, parameter);
+    }
+}
+```
+
+#### 类型处理器注册机TypeHanlderRegistry
+
+负责注册TypeHandler。
+
+TypeHandler的`setParameter()`负责给SQL语句的第i个参数赋值。但是，我们根据参数类型有着不同的TypeHanlder实现类，那么具体使用时应该调用哪个实现类来提供服务，就需要通道注册机。
+
+```java
+public final class TypeHandlerRegistry {
+    private final Map<JdbcType, TypeHandler<?>> JDBC_TYPE_HANDLER_MAP = new EnumMap<>(JdbcType.class);
+    private final Map<Type, Map<JdbcType, TypeHandler<?>>> TYPE_HANDLER_MAP = new HashMap<>();
+    private final Map<Class<?>, TypeHandler<?>> ALL_TYPE_HANDLERS_MAP = new HashMap<>();
+
+    public TypeHandlerRegistry() {
+        register(Long.class, new LongTypeHandler());
+        register(long.class, new LongTypeHandler());
+
+        register(String.class, new StringTypeHandler());
+        register(String.class, JdbcType.CHAR, new StringTypeHandler());
+        register(String.class, JdbcType.VARCHAR, new StringTypeHandler());
+    }
+
+    private <T> void register(Type javaType, TypeHandler<? extends T> typeHandler) {
+        register(javaType, null, typeHandler);
+    }
+
+    private void register(Type javaType, JdbcType jdbcType, TypeHandler<?> handler) {
+        if (null != javaType) {
+            Map<JdbcType, TypeHandler<?>> map = TYPE_HANDLER_MAP.computeIfAbsent(javaType, k -> new HashMap<>());
+            map.put(jdbcType, handler);
+        }
+        ALL_TYPE_HANDLERS_MAP.put(handler.getClass(), handler);
+    }
+
+    @SuppressWarnings("unchecked")
+    public <T> TypeHandler<T> getTypeHandler(Class<T> type, JdbcType jdbcType) {
+        return getTypeHandler((Type) type, jdbcType);
+    }
+
+    public boolean hasTypeHandler(Class<?> javaType) {
+        return hasTypeHandler(javaType, null);
+    }
+
+    public boolean hasTypeHandler(Class<?> javaType, JdbcType jdbcType) {
+        return javaType != null && getTypeHandler((Type) javaType, jdbcType) != null;
+    }
+
+    private <T> TypeHandler<T> getTypeHandler(Type type, JdbcType jdbcType) {
+        Map<JdbcType, TypeHandler<?>> jdbcHandlerMap = TYPE_HANDLER_MAP.get(type);
+        TypeHandler<?> handler = null;
+        if (jdbcHandlerMap != null) {
+            handler = jdbcHandlerMap.get(jdbcType);
+            if (handler == null) {
+                handler = jdbcHandlerMap.get(null);
+            }
+        }
+        // type drives generics here
+        return (TypeHandler<T>) handler;
+    }
+}
+```
+
+### 参数构造
+
+我们是通过`ParamenterMapping`类来记录JdbcType和JavaType的映射关系的，那么在进行映射时就应该根据参数类型来对TypeHandler进行注册。
+
+```java
+public ParameterMapping build() {
+    if (parameterMapping.typeHandler == null && parameterMapping.javaType != null) {
+        Configuration configuration = parameterMapping.configuration;
+        TypeHandlerRegistry typeHandlerRegistry = configuration.getTypeHandlerRegistry();
+        parameterMapping.typeHandler = typeHandlerRegistry.getTypeHandler(parameterMapping.javaType, parameterMapping.jdbcType);
+    }
+    return parameterMapping;
+}
+```
+
+另外，ParameterMapping的构造是在`SqlSourceBuilder`调用`GenericTokenParser#parse`时，执行其内部类`ParameterMappingTokenHandler#handleToken`来实现的。
+
+```java
+ @Override
+public String handleToken(String content) {
+    parameterMappings.add(buildParameterMapping(content));
+    return "?";
+}
+```
 
