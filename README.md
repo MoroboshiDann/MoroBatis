@@ -2891,3 +2891,341 @@ public String handleToken(String content) {
 }
 ```
 
+## 第十章 流程解耦，封装结果处理器
+
+在前面的章节中，虽然解析XML文件后得到了`resultType`属性，但是在处理返回结果时没有用到。虽然定义了ResultHandler接口，且在实例化执行器Excutor时也作为参数传入，但是一直没有实现对结果的处理逻辑。
+
+JDBC的查询结果ResultSet是可以根据不同的属性类型返回结果的，不一定必须返回Object类型对象。
+
+本章节，我们将通过XML文件解析返回结果的类型，并封装到MappedStatement类中。这样在获取到结果后，就可以按照参数类型创建对象，并使用MetaObject反射填充属性。
+
+### 出参参数处理
+
+#### ResultMap结果映射封装类
+
+在Mybatis中，一条SQL语句会有一个返回类型配置，可以是`resultType`属性，也可以是`resultMap`属性来指定。但无论使用哪种，我们都同意封装到ResultMap结果映射类中。
+
+```java
+public class ResultMap {
+    private String id;
+    private Class<?> type;
+    private List<ResultMapping> resultMappings;
+    private Set<String> mappedColumns;
+
+    private ResultMap() {
+    }
+
+    public static class Builder {
+        private ResultMap resultMap = new ResultMap();
+
+        public Builder(Configuration configuration, String id, Class<?> type, List<ResultMapping> resultMappings) {
+            resultMap.id = id;
+            resultMap.type = type;
+            resultMap.resultMappings = resultMappings;
+        }
+
+        public ResultMap build() {
+            resultMap.mappedColumns = new HashSet<>();
+            return resultMap;
+        }
+    }
+}
+```
+
+#### MapperBuilderAssistant构建器助手
+
+我们在XMLStatementBuilder类中对SQL语句的信息进行解析，并调用语言驱动来解析具体的SQL内容。最终得到的结果需要一并封装到MappedStatement对象中。由于解析过程已经在该类中实现，如果将封装过程也一并在此实现，就会显得比较臃肿，且耦合度太高。
+
+于是，我们将SQL语句解析结果的封装映射过程提取到MapperBuilderAssistant类中实现。
+
+```java
+public class MapperBuilderAssistant extends BaseBuilder {
+    private String currentNamespace;
+    private String resource;
+
+    public MapperBuilderAssistant(Configuration configuration, String resource) {
+        super(configuration);
+        this.resource = resource;
+    }
+
+    public String getCurrentNamespace() {
+        return currentNamespace;
+    }
+
+    public void setCurrentNamespace(String currentNamespace) {
+        this.currentNamespace = currentNamespace;
+    }
+
+    public String applyCurrentNamespace(String base, boolean isReference) {
+        if (base == null) {
+            return null;
+        }
+        if (isReference) {
+            if (base.contains(".")) return base;
+        }
+        return currentNamespace + "." + base;
+    }
+    /**
+     * 添加映射器语句
+     */
+    public MappedStatement addMappedStatement(
+            String id,
+            SqlSource sqlSource,
+            SqlCommandType sqlCommandType,
+            Class<?> parameterType,
+            String resultMap,
+            Class<?> resultType,
+            LanguageDriver lang
+    ) {
+        // 给id加上namespace前缀：cn.bugstack.mybatis.test.dao.IUserDao.queryUserInfoById
+        id = applyCurrentNamespace(id, false);
+        MappedStatement.Builder statementBuilder = new MappedStatement.Builder(configuration, id, sqlCommandType, sqlSource, resultType);
+
+        // 结果映射，给 MappedStatement#resultMaps
+        setStatementResultMap(resultMap, resultType, statementBuilder);
+
+        MappedStatement statement = statementBuilder.build();
+        // 映射语句信息，建造完存放到配置项中
+        configuration.addMappedStatement(statement);
+
+        return statement;
+    }
+
+    private void setStatementResultMap(
+            String resultMap,
+            Class<?> resultType,
+            MappedStatement.Builder statementBuilder) {
+        // 因为暂时还没有在 Mapper XML 中配置 Map 返回结果，所以这里返回的是 null
+        resultMap = applyCurrentNamespace(resultMap, true);
+
+        List<ResultMap> resultMaps = new ArrayList<>();
+
+        if (resultMap != null) {
+            // TODO：暂无Map结果映射配置，本章节不添加此逻辑
+        }
+        /*
+         * 通常使用 resultType 即可满足大部分场景
+         * <select id="queryUserInfoById" resultType="cn.bugstack.mybatis.test.po.User">
+         * 使用 resultType 的情况下，Mybatis 会自动创建一个 ResultMap，基于属性名称映射列到 JavaBean 的属性上。
+         */
+        else if (resultType != null) {
+            ResultMap.Builder inlineResultMapBuilder = new ResultMap.Builder(
+                    configuration,
+                    statementBuilder.id() + "-Inline",
+                    resultType,
+                    new ArrayList<>());
+            resultMaps.add(inlineResultMapBuilder.build());
+        }
+        statementBuilder.resultMaps(resultMaps);
+    }
+}
+```
+
+#### 构建器助手的使用
+
+在XMLStatementBuilder中对SQL解析完成后，将解析出来的信息传入构建器助手来封装。
+
+```java
+// 调用助手类【本节新添加，便于统一处理参数的包装】
+builderAssistant.addMappedStatement(id,
+    sqlSource,
+    sqlCommandType,
+    parameterTypeClass,
+    resultMap,
+    resultTypeClass,
+    langDriver);
+```
+
+### 查询结果封装
+
+JDBC插叙数据库的结果是一个List集合，于是，我们将对结果集合的处理交给`ResultSetHandler`来处理。然后对于集合中每一条记录，分别调用`ResultHandler`来处理。
+
+处理逻辑包括生成对象，属性填充和加入集合。
+
+#### ResultSetHandler
+
+在`createResultObject()`方法中，根据解析XML文件得来的返回类型创建对应的MetaObject元对象，然后通过反射来进行属性填充。
+
+在`applyAutomaticMappings()`方法中，对元对象的属性进行填充。
+
+```java
+public class DefaultResultSetHandler implements ResultSetHandler {
+
+    private final Configuration configuration;
+    private final MappedStatement mappedStatement;
+    private final RowBounds rowBounds;
+    private final ResultHandler resultHandler;
+    private final BoundSql boundSql;
+    private final TypeHandlerRegistry typeHandlerRegistry;
+    private final ObjectFactory objectFactory;
+
+    public DefaultResultSetHandler(Executor executor, MappedStatement mappedStatement, ResultHandler resultHandler, RowBounds rowBounds, BoundSql boundSql) {
+        this.configuration = mappedStatement.getConfiguration();
+        this.rowBounds = rowBounds;
+        this.boundSql = boundSql;
+        this.mappedStatement = mappedStatement;
+        this.resultHandler = resultHandler;
+        this.objectFactory = configuration.getObjectFactory();
+        this.typeHandlerRegistry = configuration.getTypeHandlerRegistry();
+    }
+
+    @Override
+    @SuppressWarnings("unchecked")
+    public List<Object> handleResultSets(Statement stmt) throws SQLException {
+        final List<Object> multipleResults = new ArrayList<>();
+
+        int resultSetCount = 0;
+        ResultSetWrapper rsw = new ResultSetWrapper(stmt.getResultSet(), configuration);
+
+        List<ResultMap> resultMaps = mappedStatement.getResultMaps();
+        while (rsw != null && resultMaps.size() > resultSetCount) {
+            ResultMap resultMap = resultMaps.get(resultSetCount);
+            handleResultSet(rsw, resultMap, multipleResults, null);
+            rsw = getNextResultSet(stmt);
+            resultSetCount++;
+        }
+
+        return multipleResults.size() == 1 ? (List<Object>) multipleResults.get(0) : multipleResults;
+    }
+
+    private ResultSetWrapper getNextResultSet(Statement stmt) throws SQLException {
+        // Making this method tolerant of bad JDBC drivers
+        try {
+            if (stmt.getConnection().getMetaData().supportsMultipleResultSets()) {
+                // Crazy Standard JDBC way of determining if there are more results
+                if (!((!stmt.getMoreResults()) && (stmt.getUpdateCount() == -1))) {
+                    ResultSet rs = stmt.getResultSet();
+                    return rs != null ? new ResultSetWrapper(rs, configuration) : null;
+                }
+            }
+        } catch (Exception ignore) {
+            // Intentionally ignored.
+        }
+        return null;
+    }
+
+    private void handleResultSet(ResultSetWrapper rsw, ResultMap resultMap, List<Object> multipleResults, ResultMapping parentMapping) throws SQLException {
+        if (resultHandler == null) {
+            // 1. 新创建结果处理器
+            DefaultResultHandler defaultResultHandler = new DefaultResultHandler(objectFactory);
+            // 2. 封装数据
+            handleRowValuesForSimpleResultMap(rsw, resultMap, defaultResultHandler, rowBounds, null);
+            // 3. 保存结果
+            multipleResults.add(defaultResultHandler.getResultList());
+        }
+    }
+
+    private void handleRowValuesForSimpleResultMap(ResultSetWrapper rsw, ResultMap resultMap, ResultHandler resultHandler, RowBounds rowBounds, ResultMapping parentMapping) throws SQLException {
+        DefaultResultContext resultContext = new DefaultResultContext();
+        while (resultContext.getResultCount() < rowBounds.getLimit() && rsw.getResultSet().next()) {
+            Object rowValue = getRowValue(rsw, resultMap);
+            callResultHandler(resultHandler, resultContext, rowValue);
+        }
+    }
+
+    private void callResultHandler(ResultHandler resultHandler, DefaultResultContext resultContext, Object rowValue) {
+        resultContext.nextResultObject(rowValue);
+        resultHandler.handleResult(resultContext);
+    }
+
+    /**
+     * 获取一行的值
+     */
+    private Object getRowValue(ResultSetWrapper rsw, ResultMap resultMap) throws SQLException {
+        // 根据返回类型，实例化对象
+        Object resultObject = createResultObject(rsw, resultMap, null);
+        if (resultObject != null && !typeHandlerRegistry.hasTypeHandler(resultMap.getType())) {
+            final MetaObject metaObject = configuration.newMetaObject(resultObject);
+            applyAutomaticMappings(rsw, resultMap, metaObject, null);
+        }
+        return resultObject;
+    }
+
+    private Object createResultObject(ResultSetWrapper rsw, ResultMap resultMap, String columnPrefix) throws SQLException {
+        final List<Class<?>> constructorArgTypes = new ArrayList<>();
+        final List<Object> constructorArgs = new ArrayList<>();
+        return createResultObject(rsw, resultMap, constructorArgTypes, constructorArgs, columnPrefix);
+    }
+
+    /**
+     * 创建结果
+     */
+    private Object createResultObject(ResultSetWrapper rsw, ResultMap resultMap, List<Class<?>> constructorArgTypes, List<Object> constructorArgs, String columnPrefix) throws SQLException {
+        final Class<?> resultType = resultMap.getType();
+        final MetaClass metaType = MetaClass.forClass(resultType);
+        if (resultType.isInterface() || metaType.hasDefaultConstructor()) {
+            // 普通的Bean对象类型
+            return objectFactory.create(resultType);
+        }
+        throw new RuntimeException("Do not know how to create an instance of " + resultType);
+    }
+
+    private boolean applyAutomaticMappings(ResultSetWrapper rsw, ResultMap resultMap, MetaObject metaObject, String columnPrefix) throws SQLException{
+        final List<String> unmappedColumnNames = rsw.getUnmappedColumnNames(resultMap, columnPrefix);
+        boolean foundValues = false;
+        for (String columnName : unmappedColumnNames) {
+            String propertyName = columnName;
+            if (columnPrefix != null && !columnPrefix.isEmpty()) {
+                // When columnPrefix is specified,ignore columns without the prefix.
+                if (columnName.toUpperCase(Locale.ENGLISH).startsWith(columnPrefix)) {
+                    propertyName = columnName.substring(columnPrefix.length());
+                } else {
+                    continue;
+                }
+            }
+            final String property = metaObject.findProperty(propertyName, false);
+            if (property != null && metaObject.hasSetter(property)) {
+                final Class<?> propertyType = metaObject.getSetterType(property);
+                if (typeHandlerRegistry.hasTypeHandler(propertyType)) {
+                    final TypeHandler<?> typeHandler = rsw.getTypeHandler(propertyType, columnName);
+                    // 使用 TypeHandler 取得结果
+                    final Object value = typeHandler.getResult(rsw.getResultSet(), columnName);
+                    if (value != null) {
+                        foundValues = true;
+                    }
+                    if (value != null || !propertyType.isPrimitive()) {
+                        // 通过反射工具类设置属性值
+                        metaObject.setValue(property, value);
+                    }
+                }
+            }
+        }
+        return foundValues;
+    }
+}
+```
+
+#### ResultHandler
+
+功能就是将ResultSetHandler处理好的单个记录对应的对象，加入到结果集合中。
+
+```java
+public class DefaultResultHandler implements ResultHandler {
+
+    private final List<Object> list;
+
+    public DefaultResultHandler() {
+        this.list = new ArrayList<>();
+    }
+
+    /**
+     * 通过 ObjectFactory 反射工具类，产生特定的 List
+     */
+    @SuppressWarnings("unchecked")
+    public DefaultResultHandler(ObjectFactory objectFactory) {
+        this.list = objectFactory.create(List.class);
+    }
+
+    @Override
+    public void handleResult(ResultContext context) {
+        list.add(context.getResultObject());
+    }
+
+    public List<Object> getResultList() {
+        return list;
+    }
+
+}
+```
+
+
