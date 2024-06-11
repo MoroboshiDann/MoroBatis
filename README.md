@@ -3228,4 +3228,347 @@ public class DefaultResultHandler implements ResultHandler {
 }
 ```
 
+## 第十二章 通过注解配置执行SQL语句
+
+Mybatis支持通过给方法添加注解的方式来绑定方法对应的SQL语句。如果通过注解的方式来配置SQL语句，那么在`datasource.xml`文件中需要通过`<mapper>`标签的`class=""`属性来指定被注解配置的类的全路径，即Dao接口的全路径。
+
+于是，我们解析XML文件时就需要分别处理通过`Mapper.xml`和通过注解配置SQL的逻辑。
+
+### Mapper XML 解析调用
+
+#### XMLConfigBuilder
+
+在XMLConfigBuilder解析`datasource.xml`文件时，通过读取`<mapper>`标签的`resource`和`class`属性，来判断应该调用哪部分逻辑。如果定义了`resouce`说明应该调用XMLMapperBuilder来解析`Mapper.xml`文件；如果定义了`class`属性，应该调用`MapperRegistry#addMapper`(该方法被封装在了Configuration中)。
+
+```java
+public class XMLConfigBuilder extends BaseBuilder {
+    // ... 省略部分代码
+    /*
+    <mappers>
+        <mapper resource="mapper/User_Mapper.xml"/>
+        <mapper class="cn.bugstack.mybatis.test.dao.IUserDao"/>
+    </mappers>
+     */
+    private void mapperElement(Element mappers) throws Exception {
+        List<Element> mapperList = mappers.elements("mapper");
+        for (Element e : mapperList) {
+            String resource = e.attributeValue("resource");
+            String mapperClass = e.attributeValue("class");
+            // XML 解析
+            if (resource != null && mapperClass == null) {
+                InputStream inputStream = Resources.getResourceAsStream(resource);
+                // 在for循环里每个mapper都重新new一个XMLMapperBuilder，来解析
+                XMLMapperBuilder mapperParser = new XMLMapperBuilder(inputStream, configuration, resource);
+                mapperParser.parse();
+            } else if (resource == null && mapperClass != null) { // Annotation 注解解析
+                Class<?> mapperInterface = Resources.classForName(mapperClass);
+                configuration.addMapper(mapperInterface);
+            }
+        }
+    }
+}
+```
+
+#### MapperRegistry
+
+在`addMapper()`方法中，判断给出的被注解修饰的类是否为接口，然后调用`MapperAnnotationBuilder`来接口文件中所有解析方法上的注解。
+
+```java
+public <T> void addMapper(Class<T> type) {
+    /* Mapper 必须是接口才会注册 */
+    if (type.isInterface()) {
+        if (hasMapper(type)) {
+            // 如果重复添加了，报错
+            throw new RuntimeException("Type " + type + " is already known to the MapperRegistry.");
+        }
+        // 注册映射器代理工厂
+        knownMappers.put(type, new MapperProxyFactory<>(type));
+        // 解析注解类语句配置
+        MapperAnnotationBuilder parser = new MapperAnnotationBuilder(config, type);
+        parser.parse();
+    }
+}
+```
+
+### 注解配置构建器
+
+在Mybatis框架的实现中，有专门一个annotations注解包，来提供用于配置到DAO方法上的注解，这些注解包括了所有的增删改查操作，同时可以设定一些额外的返回参数等。
+
+#### 注解定义
+
+给出CRUD四种注解的定义。生命周期都是运行时存在，作用范围都是方法注解。
+
+```java
+@Retention(RetentionPolicy.RUNTIME)
+@Target(ElementType.METHOD)
+public @interface Insert {
+
+    String[] value();
+
+}
+
+@Retention(RetentionPolicy.RUNTIME)
+@Target(ElementType.METHOD)
+public @interface Delete {
+
+    String[] value();
+    
+}
+
+@Retention(RetentionPolicy.RUNTIME)
+@Target(ElementType.METHOD)
+public @interface Update {
+
+    String[] value();
+
+}
+
+@Retention(RetentionPolicy.RUNTIME)
+@Target(ElementType.METHOD)
+public @interface Select {
+
+    String[] value();
+
+}
+```
+
+#### 配置解析MapperAnnotationBuilder
+
+在构造器中需要拿到四个注解的Class对象，便于后续解析时判断SQL类型。以及Dao接口的全路径名，作为命名空间，给SQL语句的ID添加前缀。
+
+然后在`parse()`方法中，通过Dao接口的Class对象获取接口中定义的所有方法，一一进行解析。
+
+```java
+public MapperAnnotationBuilder(Configuration configuration, Class<?> type) {
+    String resource = type.getName().replace(".", "/") + ".java (best guess)";
+    this.assistant = new MapperBuilderAssistant(configuration, resource);
+    this.configuration = configuration;
+    this.type = type;
+    
+    sqlAnnotationTypes.add(Select.class);
+    sqlAnnotationTypes.add(Insert.class);
+    sqlAnnotationTypes.add(Update.class);
+    sqlAnnotationTypes.add(Delete.class);
+}
+
+public void parse() {
+    String resource = type.toString();
+    if (!configuration.isResourceLoaded(resource)) {
+        assistant.setCurrentNamespace(type.getName());
+        Method[] methods = type.getMethods();
+        for (Method method : methods) {
+            if (!method.isBridge()) {
+                // 解析语句
+                parseStatement(method);
+            }
+        }
+    }
+}
+```
+
+解析方法的大致流程和解析XML文件中SQL标签类似，都是解析出ID，入参类型和返回结果类型，并通过语言驱动器来为SQL生成一个SqlSource对象，最后一起封装到MappedStatement中。
+
+最大的不同是获取SqlSource是通过解析方法上的注解来获取SQL语句的，调用的是重载的`LanguageDriver#createSqlSource`方法。
+
+```java
+private void parseStatement(Method method) {
+    Class<?> parameterTypeClass = getParameterType(method);
+    LanguageDriver languageDriver = getLanguageDriver(method);
+    SqlSource sqlSource = getSqlSourceFromAnnotations(method, parameterTypeClass, languageDriver);
+    if (sqlSource != null) {
+        final String mappedStatementId = type.getName() + "." + method.getName();
+        SqlCommandType sqlCommandType = getSqlCommandType(method);
+        boolean isSelect = sqlCommandType == SqlCommandType.SELECT;
+        String resultMapId = null;
+        if (isSelect) {
+            resultMapId = parseResultMap(method);
+        }
+        
+        // 调用助手类
+        assistant.addMappedStatement(
+                mappedStatementId,
+                sqlSource,
+                sqlCommandType,
+                parameterTypeClass,
+                resultMapId,
+                getReturnType(method),
+                languageDriver
+        );
+    }
+}
+```
+
+### 语言驱动器
+
+#### XMLLanguageDriver
+
+```java
+@Override
+public SqlSource createSqlSource(Configuration configuration, String script, Class<?> parameterType) {
+    // 暂时不解析动态 SQL
+    return new RawSqlSource(configuration, script, parameterType);
+}
+```
+
+## 第十三章 解析和使用ResultMap映射参数配置
+
+通常，在数据库的属性字段命名时，会采用小写字母加下户线分割的方式。但是，在Java程序中的Pojo类定义时，对应的字段会采用驼峰命名的方式。那么，再进行数据库查询时，我们需要将数据库的字段名称正确映射到Java代码中的驼峰字段，才能够将查询结果正确映射到返回对象上。虽然，我们可以在Mybatis中使用`employee_name as emmployeeName`这样的方式来实现，但是不够优雅。
+
+本章节，我们通过ResultMap来实现命名的映射。
+
+### 解析映射配置
+
+我们可以在`Mapper.xml`文件中，添加`<resultMap>`标签来完成命名属性的映射。
+
+#### 解析入口
+
+为了能够解析`<resultMap>`标签，我们需要在XMLMapperBuilder类中，添加解析resultMap的操作。这部分操作需要放在解析select等标签之前。因为，select标签的返回值类型会调用resultMap标签。
+
+```java
+private void configurationElement(Element element) {
+    // 1.配置namespace
+    String namespace = element.attributeValue("namespace");
+    if (namespace.equals("")) {
+        throw new RuntimeException("Mapper's namespace cannot be empty");
+    }
+    builderAssistant.setCurrentNamespace(namespace);
+    // 2. 解析resultMap
+    resultMapElements(element.elements("resultMap"));
+    // 3.配置select|insert|update|delete
+    buildStatementFromContext(element.elements("select"),
+            element.elements("insert"),
+            element.elements("update"),
+            element.elements("delete")
+    );
+}
+```
+
+#### 解析过程
+
+对resultMaps中每一个`<resultMap>`分别进行解析。
+
+```java
+private void resultMapElements(List<Element> list) {
+    for (Element element : list) {
+        try {
+            resultMapElement(element, Collections.emptyList());
+        } catch (Exception ignore) {
+        }
+    }
+}
+```
+
+根据`type`属性指定的全类名，获取到返回对象的的类Class对象。
+
+然后，为每一条需要映射的属性，构建一个`ResultMapping`对象，并将所有的该类型对象记录在一个List集合中。
+
+最后，和本条resultMap标签的id一起，封装到一个ResultMap对象中。便完成了一个返回类型的字段映射解析。
+
+```java
+private ResultMap resultMapElement(Element resultMapNode, List<ResultMapping> additionalResultMappings) throws Exception {
+    String id = resultMapNode.attributeValue("id");
+    String type = resultMapNode.attributeValue("type");
+    Class<?> typeClass = resolveClass(type);
+
+    List<ResultMapping> resultMappings = new ArrayList<>();
+    resultMappings.addAll(additionalResultMappings);
+
+    List<Element> resultChildren = resultMapNode.elements();
+    for (Element resultChild : resultChildren) {
+        List<ResultFlag> flags = new ArrayList<>();
+        if ("id".equals(resultChild.getName())) {
+            flags.add(ResultFlag.ID);
+        }
+        // 构建 ResultMapping
+        resultMappings.add(buildResultMappingFromContext(resultChild, typeClass, flags));
+    }
+
+    // 创建结果映射解析器
+    ResultMapResolver resultMapResolver = new ResultMapResolver(builderAssistant, id, typeClass, resultMappings);
+    return resultMapResolver.resolve();
+}
+
+private ResultMapping buildResultMappingFromContext(Element context, Class<?> resultType, List<ResultFlag> flags) throws Exception {
+    String property = context.attributeValue("property");
+    String column = context.attributeValue("column");
+    return builderAssistant.buildResultMapping(resultType, property, column, flags);
+}
+```
+
+### 存放映射对象
+
+#### 映射解析
+
+ResultMapResolver 结果映射器是本章节新增加的内容，其实它的作用就是对解析结果内容的一个封装处理，最终调用的是还是 MapperBuilderAssistant 映射构建器助手，所提供 ResultMap 封装和保存操作。
+
+```java
+public class ResultMapResolver {
+    private final MapperBuilderAssistant assistant;
+    private String id;
+    private Class<?> type;
+    private List<ResultMapping> resultMappings;
+	// ... 省略构造函数
+    public ResultMap resolve() {
+        return assistant.addResultMap(this.id, this.type, this.resultMappings);
+    }
+}
+```
+
+#### 封装ResultMap
+
+```java
+public class ResultMap {
+    private String id;
+    private Class<?> type;
+    private List<ResultMapping> resultMappings;
+    private Set<String> mappedColumns;
+
+    private ResultMap() {}
+
+    public static class Builder {
+        private ResultMap resultMap = new ResultMap();
+
+        public Builder(Configuration configuration, String id, Class<?> type, List<ResultMapping> resultMappings) {
+            resultMap.id = id;
+            resultMap.type = type;
+            resultMap.resultMappings = resultMappings;
+        }
+
+        public ResultMap build() {
+            resultMap.mappedColumns = new HashSet<>();
+           
+           // 添加 mappedColumns 字段
+            for (ResultMapping resultMapping : resultMap.resultMappings) {
+                final String column = resultMapping.getColumn();
+                if (column != null) {
+                    resultMap.mappedColumns.add(column.toUpperCase(Locale.ENGLISH));
+                }
+            }
+            return resultMap;
+        }
+    }
+}
+```
+
+#### 添加ResultMap
+
+```java
+public ResultMap addResultMap(String id, Class<?> type, List<ResultMapping> resultMappings) {
+    // 补全ID全路径，如：cn.bugstack.mybatis.test.dao.IActivityDao + activityMap
+    id = applyCurrentNamespace(id, false);
+
+    ResultMap.Builder inlineResultMapBuilder = new ResultMap.Builder(
+            configuration,
+            id,
+            type,
+            resultMappings);
+
+    ResultMap resultMap = inlineResultMapBuilder.build();
+    configuration.addResultMap(resultMap);
+    return resultMap;
+}
+```
+
+# 第十九章 整合Spring
+
 
