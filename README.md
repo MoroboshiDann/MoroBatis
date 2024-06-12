@@ -3569,6 +3569,23 @@ public ResultMap addResultMap(String id, Class<?> type, List<ResultMapping> resu
 }
 ```
 
-# 第十九章 整合Spring
+## 第十九章 整合Spring
+
+整合Spring，就需要将ORM框架交给Spring来管理。而我们手写的MyBatis框架将多边的服务都封装在了SqlSession中，而且我们实现了SqlSessionFactory，向外提供SqlSession对象。
+
+于是，我们需要将工厂对象交给IoC容器来管理。Spring提供了FactoryBean接口，实现该接口的类对象会被注入到容器中，因此我们只需实现一个SqlSessionFactoryBean类，实现该接口，同时将工厂对象封装进去，就可以让Spring IoC容器来管理工厂对象。同时，我们实现Spring中的InitializingBean接口，在其中启动MyBatis的流程(加载解析XML文件)。
+
+另外，框架中Dao接口的代理类也需要交给Spring容器来管理，实现依赖注入。我们定义一个MapperScannerConfigurer，将Dao接口全部扫描出来，完成代理并将代理对象全部注入到Spring容器中。即，扫描包路径下的class文件，从中获取对应的class类，然后通过Spring提供的注册接口，将代理类注册到容器中。
+
+接着，我们需要实现MapperFactoryBean类，前面已经将Dao接口的代理类对象注册进了Spring容器，我们就需要在这个类中实现获取该代理对象的逻辑，即通过Dao接口的class对象来直接从SqlSession中获取。
 
 
+## 第二十章 整合SpringBoot
+
+SpringBoot的核心主要是自动配置类，我们需要为MyBatis实现一个自动配置类。
+
+首先，SpringBoot中我们一般不通过XML文件的方式来配置项目，而是通过yaml文件。于是，我们需要定义一个MyBatisProperties类，负责从yaml文件中读取出定义的数据源信息和mapper路径等。
+
+然后，再定义MyBatisAutoConfiguration类，来实现自动配置。在其中，将MyBatisProperties中的信息封装到一个Document对象中，交给SqlSessionFactoryBuilder来构建工厂对象。并将返回值注册为Bean。
+
+然后将自动配置类的全路径名写到spring.factories中，开启自动配置。
