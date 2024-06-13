@@ -60,9 +60,15 @@ Mybatis的作用：
 
 Mybatis就是通过反射和代理的方式，为我们定的接口实现了一个代理类Mapper，代理类来实现该接口。从而，可以通过Mapper对象来调用接口中定义的方法，去实现数据库的CRUD操作。
 
+JDK代理原理：
+
+JDK提供的`java.lang.reflect.Proxy`类中，有`newProxyInstance(ClassLoader loader, Class<?>[] interfaces, InvocationHandler h)`可以为传入的接口创建一个代理类实例。创建时，需要传入一个`InvocationHandler`接口的实现类对象，该实现类对象需要重写`invoke()`方法。
+
+`Proxy#newInstance`方法返回的代理类对象实现了被代理的接口，因此，调用接口的方法，会调用代理对象中的方法。而代理对象则会调用`InvocationHandler#invoke`方法，将被调用方法和传入参数传给`invoke()`。相当于在`invoke()`方法中执行具体被调用方的逻辑。
+
 ### MapperProxy
 
-于是，我们先创建一个代理类`MapperProxy`，通过反射(`java.lang.reflect`)的方式，在`invoke()`方法中，实现Dao接口中抽象方法的执行逻辑。
+于是，我们先创建一个代理类`MapperProxy`实现InvocationHandler接口，重写`invoke()`方法，在其中实现Dao接口中方法的具体执行逻辑。
 
 ```java
 public class MapperProxy<T> implements InvocationHandler, Serializable {
@@ -88,7 +94,9 @@ public class MapperProxy<T> implements InvocationHandler, Serializable {
 
 ### MapperProxyFactory
 
-然后，再使用工厂模式，创建一个`MapperProxyFactory`代理工厂，来为我们生成代理类对象。生成代理对象的做法为，通过`java.lang.reflect`包中提供的API，去生成指定Dao接口的代理对象并返回。
+然后，再使用工厂模式，创建一个`MapperProxyFactory`代理工厂，通过动态代理(`java.lang.reflect.Proxy`)的方式，为Dao接口生成代理对象。该代理对象实现了Dao接口，于是可以直接通过代理对象来调用Dao接口中的方法。当调用Dao接口方法时，实际上执行的是上文提到的`MapperProxy#invoke`方法。
+
+由于，一个Dao接口只会生成一个代理对象，且代理对象实现了Dao接口，通过接口就可以获取到代理对象，就像映射一般。所以，我们称代理对象为Mapper对象。
 
 ```java
 public class MapperProxyFactory<T> {
@@ -105,25 +113,29 @@ public class MapperProxyFactory<T> {
 }
 ```
 
-代理工厂给我们返回的代理对象就是Dao接口的实现类对象，即Mapper对象，我们可以直接通过Mapper对象调用Dao接口中的方法。
+### 映射关系
+
+一个Dao接口 -> 一个Mapper对象 -> MapperProxy工厂 -> MapperProxy对象
 
 
 ## 第二章 实现映射器的注册和使用
 
-在第一章的代码中，工厂创建代理对象时，需要传入一个Map集合(在代码中参数名为`SqlSession`)，这个Ma集合是用来告知工厂需要对哪个接口进行代理，这里存在硬编码问题。同时，虽然名为`SqlSession`但却用的是Map，并不是真正的SqlSession对象。
+第一章的讲解中，可以看出Dao接口、Mapper对象、MapperProxy对象、MapperProxy工厂都是一一对应的，创建MapperProxyFactory工厂对象时就需要以参数的形式告知要生成哪个Dao接口的Mapper对象。
 
-参考SpringMVC的做法，在项目启动时，用户只需要指定路径即可完成对需要代理的Dao的扫描和注册。于是，我们需要对映射器的注册提供注册器来处理，同时还需要对SqlSession进行规范化处理，让它可以将我们的映射器代理和方法调用进行包装，建立一个生命周期模型，方便后期扩展。
+那么，如何能够将这种一一对应的关系绑定起来呢。本章就实现一个映射器注册机来将所有的Dao接口何其对应的MapperProxyFactory绑定起来。只要Dao接口和工厂对象绑定起来，其余的关系也就绑定起来了。
+
+在绑定Dao接口和工厂对象时，不能采用硬编码的方式。参考SpringMVC的做法，在项目启动时，用户只需要指定路径即可完成对需要代理的Dao的扫描和注册。于是，我们需要对映射器的注册提供注册器来处理，同时还需要对SqlSession进行规范化处理，让它可以将我们的映射器代理和方法调用进行包装，建立一个生命周期模型，方便后期扩展。
 
 经上述分析，我们需要一个注册器类，它可以扫描包路径完成Dao接口与代理类的映射。以及一个SqlSession接口的定义。
 
-### MapperRegistry注册器类
+### MapperRegistry映射器注册器类
 
-注册器类，其功能顾名思义就是将Dao接口与代理工厂一一对应起来，相当于完成了注册。则其应该实现如下方法：
+注册器类，其功能顾名思义就是将Dao接口与代理工厂一一对应起来。则其应该实现如下方法：
 - `getMapper`：根据Dao接口，返回对应的代理类实例。
 - `addMapper`：存储Dao接口与其代理工厂的映射关系，完成注册。
 - `hasMapper`：根据Dao接口，查询是否已经注册了与代理工厂的映射关系。
 
-于是，可以通过一个Map集合来存储映射关系。
+绑定Dao接口和工厂对象，就是通过Map集合来记录二者的映射关系即可。
 
 ```java
 public class MapperRegistry {
@@ -171,9 +183,11 @@ public class MapperRegistry {
 
 ### SqlSession规范
 
+SqlSession即SQL会话，代表Java程序和数据库的一次会话。在Java程序中，一个Dao接口往往代表的是对数据库中一个表的操作，而一个会话中可能会操作任意一张表，也可能会操作多张表。因此，SqlSession中需要一个MapperRegistry实例，来通过Dao接口获取对应的Mapper对象，以在会话中操作对应的数据库表。
+
 目前，先拿最简单的`select`语句作为基础功能。SqlSession应该提供如下功能：
-- `getMapper`：根据传入的Dao接口类型，返回对应的代理类实例。
-- `selectOne`：传入参数为`String statement`，SQL语句的ID，方法应该根据该ID，执行对应的SQL，返回数据库中的一条记录。
+- `getMapper`：根据传入的Dao接口类型，返回对应的Mapper实例。
+- `selectOne`：传入参数为`String statement`，SQL语句的ID。方法应该根据该ID，执行对应的SQL，返回数据库中的一条记录。
 
 ```java
 public interface SqlSession {
@@ -228,7 +242,7 @@ public interface SqlSessionFactory {
 
 在这里，先提供一种默认实现类。
 
-对于SqlSession，既然要能够返回Dao接口的代理对象，那么就应该在其内部包含一个注册器类`MapperRegistry`。
+在Java程序中，一个Dao接口往往代表的是对数据库中一个表的操作，而一个会话中可能会操作任意一张表，也可能会操作多张表。因此，SqlSession中需要一个MapperRegistry实例，来通过Dao接口获取对应的Mapper对象，以在会话中操作对应的数据库表。
 
 ```java
 public class DefaultSqlSession implements SqlSession {
@@ -278,15 +292,15 @@ public class DefaultSqlSessionFactory implements SqlSessionFactory {
 
 ## 第三章 Mapper XML的解析和注册使用
 
-Mybatis的核心逻辑就是：提供一个Dao接口的代理类Mapper，Mapper中需要对XML文件进行解析和处理。
+Mybatis中，Dao接口中的每一个方法，都会对应着一条SQL语句。并且，将一个Dao接口中所有对应的SQL都存放在一个`xxxMapper.xml`文件中。所有的Mapper XML文件的路径都存放在配置文件的`<mappers>`标签中。
 
-在第二章，我们已经通过MapperRegistry类来扫描包路径对Mapper进行注册。如果，我们将命名空间、SQL描述、映射信息统一维护到一个XML文件中，那么我们解析XML文件即可Mapper的注册和SQL管理。
+在第二章，我们已经通过MapperRegistry类来扫描包路径对Dao接口进行注册。本章节，我们就解析所有的`xxxMapper.xml`文件来获取将命名空间、SQL描述、映射信息。
 
-所以，本章的重点就是如何解析XML文件。在本章节只对`<mappers>`标签的内容解析，获取其中的SQL语句。
+所以，本章的重点就是如何解析XML文件。在本章节只对`<mappers>`标签中指定的Mapper XML文件路径进行解析，获取其中的SQL信息。
 
 ### SqlSessionFactoryBuilder
 
-首先，需要定义一个`SqlSessionFactoryBuilder`工厂建造者模式类，作为整个MoroBatis的入口。通过入口I/O的方式，对XML文件进行解析。在目前阶段，主要解析SQL语句，并注册Mapper，串联出整个核心流程的脉络。
+首先，需要定义一个`SqlSessionFactoryBuilder`工厂建造者模式类，作为整个MoroBatis的入口。通过入口I/O的方式，对配置XML文件进行解析。在目前阶段，主要解析SQL语句，并注册Mapper，串联出整个核心流程的脉络。
 
 ```java
 public class SqlSessionFactoryBuilder {
@@ -301,9 +315,11 @@ public class SqlSessionFactoryBuilder {
 }
 ```
 
-在代码中，使用I/O创建了一个`XMLConfigBuilder`对象，其内部会对XML文件进行解析，将命名空间、SQL描述、资源等等信息解析出来，放置在`Configuration`对象中。然后调用`XMLConfigBuilder.parse()`方法返回这个Configuration对象。
+在代码中，使用I/O创建了一个`XMLConfigBuilder`对象，其内部会对配置XML文件进行解析，将命名空间、SQL描述、资源等等信息解析出来，放置在`Configuration`对象中。然后调用`XMLConfigBuilder.parse()`方法返回这个Configuration对象。
 
 SqlSessionFactoryBuilder再利用获取的Configuration对象来创建SqlSessionFactory工厂对象并返回。
+
+整个程序只会有一个SqlSessionFactoryBuilder对象，因此配置XML文件只会被解析一次，同时也只会有一个SqlSessionFactory对象。由于只解析一次XML，因此整个程序也只会有一个Configuration对象。
 
 ### XMLConfigBuilder
 
@@ -385,7 +401,9 @@ public class XMLConfigBuilder extends BaseBuilder {
 
 ### Configuration
 
-Configuration类是一个配置类，其对MapperRegistry的功能再做了一次封装。配置类将XMLConfigBuilder解析出来的XML文件的信息存储在内部。
+Configuration类是配置类，整个程序只会有一个实例。它将记录整个程序中关于数据库操作的所有信息，如：SQL语句、Mapper对象、数据库信息、数据源等。
+
+其对MapperRegistry的功能再做了一次封装。配置类将XMLConfigBuilder解析出来的XML文件的信息存储在内部。(其实，Configuration将其存储的各个不部分的信息都做了封装，直接操作Configuration对象就能获取到各种信息)。
 
 具体在使用MoroBatis时，通过`Reader`I/O对象，指定XML文件，然后通过SqlSessionFactoryBuilder根据Reader对象，解析XML文件，返回SqlSessionFactory工厂对象。然后，再根据工厂对象获取SqlSession对象。有了SqlSession对象，就可以根据Dao接口来获取Mapper代理对象，去使用Mapper中的方法与数据库进行交互。
 
@@ -395,7 +413,6 @@ public class Configuration {
      * 映射注册机
      */
     protected MapperRegistry mapperRegistry = new MapperRegistry(this);
-
     /**
      * 映射的语句，存在Map里
      */
@@ -446,7 +463,6 @@ public class MappedStatement {
     MappedStatement() {
         // constructor disabled
     }
-
     /**
      * 建造者
      */
@@ -717,9 +733,11 @@ public interface Transaction {
 
 #### JdbcTransaction
 
-有了事务的定义，我们给出一个实现。
+有了事务的定义，我们给出一个基于JDBC事务的实现。
 
-可以看出，如果是通过数据源创建的事务，获取连接时是通过dataSource来实现的。即从数据库连接池中拿到一个连接返回。
+我们创建事务时，可以通过数据库连接Connection直接创建，也可以通过数据源DataSource来创建。
+
+由于是基于JDBC事务来实现的，所以事务的提交、回滚和关闭都是直接通过数据库连接Connection提供的接口来实现的。
 
 ```java
 public class JdbcTransaction implements Transaction {
@@ -887,7 +905,9 @@ public enum JdbcType {
 
 #### ParameterMapping参数映射
 
-该类型的每一个实例记录一个数据库类型和Java类型的对应关系。
+在Mapper XML文件的SQL语句标签中，通常会以`#{property,javaType=int,jdbcType=NUMERIC}`的形式，给出当前参数名、参数的Java类型和数据库类型。
+
+我们用一个ParameterMapping对来记录下一对映射关系。
 
 ```java
 public class ParameterMapping {
