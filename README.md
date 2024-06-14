@@ -1027,6 +1027,8 @@ private <T> List<T> resultSet2Obj(ResultSet resultSet, Class<?> clazz) {
 
 既然已经有数据源的实现，我们只需要创建数据源工厂即可。首先，给出DataSourceFactory接口的定义。其核心功能就是返回一个数据源。
 
+有了数据源之后，我们获取数据库连接就直接向dataSource实例来获取。
+
 ```java
 public interface DataSourceFactory {
     void setProperties(Properties props);
@@ -1097,7 +1099,7 @@ public class DruidDataSourceFactory implements DataSourceFactory {
 
 `initializeDriver()`方法会检查当前非池化型数据源实例使用的驱动是否已经被加载进内存，如果没有就会将其加载，并实例化一个驱动对象。同时记录进Map集合。
 
-通过代码可以看出，非池化型的数据源只会保持一个Connection实例，在初始化驱动方法中加载驱动创建数据库连接，通过`DriverManager#getConnection`来获取连接的，如果没有可用连接就会抛出异常。
+通过代码可以看出，非池化型的数据源在初始化驱动方法中加载驱动，通过`DriverManager#getConnection`来获取连接的，如果没有可用连接就会抛出异常。
 
 ```java
 public class UnpooledDataSource implements DataSource {
@@ -1226,47 +1228,12 @@ public class UnpooledDataSource implements DataSource {
     public Connection getConnection(String username, String password) throws SQLException {
         return doGetConnection(username, password);
     }
-
-    @Override
-    public <T> T unwrap(Class<T> iface) throws SQLException {
-        throw new SQLException(getClass().getName() + " is not a wrapper.");
-    }
-
-    @Override
-    public boolean isWrapperFor(Class<?> iface) throws SQLException {
-        return false;
-    }
-
-    @Override
-    public PrintWriter getLogWriter() throws SQLException {
-        return DriverManager.getLogWriter();
-    }
-
-    @Override
-    public void setLogWriter(PrintWriter logWriter) throws SQLException {
-        DriverManager.setLogWriter(logWriter);
-    }
-
-    @Override
-    public void setLoginTimeout(int loginTimeout) throws SQLException {
-        DriverManager.setLoginTimeout(loginTimeout);
-    }
-
-    @Override
-    public int getLoginTimeout() throws SQLException {
-        return DriverManager.getLoginTimeout();
-    }
-
-    @Override
-    public Logger getParentLogger() throws SQLFeatureNotSupportedException {
-        return Logger.getLogger(Logger.GLOBAL_LOGGER_NAME);
-    }
 }
 ```
 
 #### UnpooledDataSourceFactory
 
-核心功能为返回一个非池化型的数据源实例。
+核心功能为返回一个非池化型的数据源实例。创建数据源时就将从XML文件解析出来的数据源属性赋给数据源。
 
 ```java
 public class UnpooledDataSourceFactory implements DataSourceFactory {
@@ -1295,20 +1262,21 @@ public class UnpooledDataSourceFactory implements DataSourceFactory {
 
 当用户想要获取链接的时候，则会从连接池中进行获取，同时判断是否有空闲链接、最大活跃链接多少，以及是否需要等待处理或是最终抛出异常。
 
-> 池化的数据源，其内部包含一个非池化的数据源，保持一个Connection实例。PooledConnection
+> 池化数据源是对非池化型数据源的封装，在其基础上扩展了一个数据库连接池，将数据库连接通过链接池来维护，这样就不需要每次使用完Connection都断开，避免了重复的创建和释放，节省系统资源。
 
 #### PooledConnection池化连接处理
 
-池化数据源，用户执行了`close()`方法后，不能真的关闭Connection，而是将其释放回连接池，允许其他用户获取。因此，就需要对Connection类进行代理包装，处理`close()`方法。
+池化连接，是对数据库连接Connection的代理封装。
 
-PooledConnection实现InvocationHandler接口，重写`invoke()`方法，在其中执行Connection中方法的具体逻辑。
+首先，`java.sql.Connection`只是一个接口，其实现类为数据库的物理连接。但是Connection接口没有支持数据源连接池的功能，当其执行`close()`方法时，会真的关闭连接。为此，我们可以通过代理的方式，为从DriverManager那里获得的Connection对象，生成一个代理对象，让用户使用这个代理对象来操作数据库，这样执行`close()`方法时我们可以进行特殊操作。
 
-PooledConnection需要记录被代理的真实连接Connection对象，并通过代理的方式生成一个代理的Connection对象。
-- 真实连接的Connection实例，可能不是一一对应的，一个Connection可能对应多个PooledConnection。// TODO ? 真的吗
+但是，真正的Connection对象是一个实例对象，并不是一个接口，我们不能像Mapper对象那样(一个Dao接口只会有一个Mapper对象)直接创建一个Mapper代理。因此，我们设计PooledConnection类，用来记录真实的Connection和我们实例化的代理Connection对象，的映射关系。
 
-`invoke()`方法中，需要判断当前执行的是什么方法。如果是`close()`方法，则执行数据源中的`pushConnection()`方法，将连接置为可用。
+虽然，一个真实的Connection对象可能会多次被创建代理，但是同时一时刻，它只会存在一个可用的代理对象。每次用户使用数据库连接时，就将代理链接ProxyConnection对象交给其使用，使用完毕后无论活跃连接是否充足，都会将这次代理的对象废除。
 
-> 代理连接PooledConnection的作用就是，给每一个数据库连接Connection生成一个代理对象，每当要执行`Connection#close`时，就执行代理连接的逻辑，即`PooledDataSource#pushConnection`。
+PooledConnection实现InvocationHandler接口，重写`invoke()`方法，因此当使用代理链接调用方法时，都会被`invoke()`方法拦截，然后判断是否为`close()`关闭连接方法，如果是就要交给数据源链接池来管理。
+
+每次使用完连接，都会将当前映射关系置为`false`，这样连接池就会通过检查PooledConnection的状态来将其从池中移除。但是，真实的Connection还是不会直接释放，而是按需决定释放还是创建新的代理。
 
 ```java
 public class PooledConnection implements InvocationHandler {
@@ -1380,25 +1348,20 @@ public class PooledConnection implements InvocationHandler {
 
 ##### pushConnection
 
-`PooledDataSource#pushConnection`用于回收连接。核心逻辑是判断需要回收的连接是否有效、空闲连接的数量以及保证数据库一致性。
+当用户使用完数据库连接后，会执行`Connection#close`方法。但是由于操作的是代理连接对象，因此会执行`invoke()`中的逻辑，在其中调用`PooledDataSource#pushConnection`用于回收连接。核心逻辑是判断需要回收的连接是否有效、空闲连接的数量以及保证数据库一致性。
 
 先检查连接是否无效，如果无效就打印日志，无需处理逻辑。
 
-如果有效，就需要判断空闲连接数是否小于设定值，如果大于设定值，证明空闲连接比较充足，回收连接后直接PooledConnection对应的Connection关闭即可。
+如果有效，就需要判断空闲连接数是否小于阈值，如果大于阈值，证明空闲连接比较充足，于是本条真实连接可以释放，于是调用`Connection#close`(注意，此处调用的必须是真实连接的对象，才不会被代理对象拦截而进入死循环，因此使用PooledConnection来管理映射关系是有必要的)。真实连接已经关闭，PooledConnection映射关系也被置为无效。
 
-如果小于设定值，就实例化一个新的PooledConnection，加入到连接池中。
+如果小于阈值，证明连接池中连接不足，本条真实连接对象还需要继续维持在连接池中，不能释放。于是，为真实连接再次创建一个代理对象，用PooledConnection来记录映射关系。原来的PooledConnection由于已经执行过一次数据库操作，还是被丢弃。
 
 
 ##### popConnection
 
-`PooledDataSource#popConnection`用于获取链接(向外界返回连接)。其执行逻辑是一个无限循环，只有抛出异常才会停止。外界申请获得连接时，会先判断有无空闲连接，入股有，就直接返回一个空闲的PooledConnection；如果没有执行以下逻辑：
+`PooledDataSource#popConnection`方法返回一个Connection的代理对象。会检查连接池的状态，如果有空闲连接就从连接池中拿出来，如果没有就创建一个。
 
-如果活跃连接数没有达到上限，就创建一个新的PooledConnection，并返回。如果已经到达上限，无法创建新的连接，只能淘汰已有的连接。
-
-先找到存活时间最长的连接，检查是否已经过期，如果过期就删除(需要注意数据库一致性)，并实例化一个新的连接。否则，不能删除，只能让当前的申请阻塞等待。
-
-在返回新连接之前，需要作出处理。
-
+从数据库连接池中拿出来的其实是管理映射映射关系的PooledConnection对象，拿到连接后，需要进行一些列设置，然后将代理对象返回给调用者。
 
 ```java
 PooledDataSource implements DataSource {
@@ -1763,13 +1726,15 @@ public class PoolState {
 
 ## 第六章 SQL执行器的定义
 
-在上一章节中，我们实现了池化数据源和非池化数据源，但是，与数据源以及与数据库的操作逻辑是直接写在SqlSession中的。这不利于后期扩展其他数据源，也不利于SqlSession中新增其他的CRUD方法(每一个方法都需要去直接与数据源交互)。
+目前，用户调用Dao接口方法后，我们通过Mapper对象代理处理，调用了`SqlSession#selectOne`方法。但是，执行一条SQL语句的具体过程：根据ID获取SQL、通过数据源获取数据库连接、准备PreparedStatement、给SQL传入参数、返回结果处理等，全部放在了该方法中。
 
-所以，我们应该将对数据源的调用、SQL的执行和结果的处理都抽取出来，只提供一个方法入口，这样方便后期扩展和维护。
+这样做，后续扩展出其他的CRUD方法，都需要重新书写一遍该逻辑，代码冗余严重。且代码耦合性太高，不利于维护。
+
+这一部分代码的功能就是执行SQL，于是我们可以将其抽取出来一个执行器接口，这样只需要在SqlSession中调用执行器就可以完成后续操作。
 
 主要分为两部分：执行器和语句处理器
-- 执行器负责具体的执行逻辑。
-- 语句处理器负责将SQL语句的处理，如传参操作等。
+- 执行器负责具体的执行逻辑。以Executor接口定义为执行器入口，确定出事务和操作和SQL执行的统一标准接口。
+- 语句处理器负责将SQL语句的处理，如传参操作等。在具体的简单SQL执行器实现类中，处理`doQuery`方法的具体操作过程。这个过程中则会引入进来SQL语句处理器的创建。
 
 ### 执行器的定义和实现
 
@@ -1778,6 +1743,10 @@ public class PoolState {
 在具体的实现类中，完成SQL执行的具体逻辑。
 
 #### Executor
+
+执行器主要有如下功能：
+- 执行CRUD功能。
+- 负责事务的提交回滚等操作。
 
 ```java
 public interface Executor {
@@ -1797,7 +1766,9 @@ public interface Executor {
 
 #### BaseExecutor
 
-事务的操作逻辑都是一致的，所以直接在抽象类中定义。具体的SQL语句的执行逻辑是因SQL语句不同而变化的，所以放在实现在类中实现。
+事务的操作和CRUD的部分操作逻辑都是一致的，所以直接在抽象类中定义。具体的SQL语句的执行逻辑是因SQL语句不同而变化的，所以放在实现在类中实现。
+
+这里采用的是模板模式，将共性操作抽取到抽象类中，子类根据需求实现不同的局部逻辑。于是可以在不修改代码的前提下，改变具体的执行逻辑。
 
 ```java
 public abstract class BaseExecutor implements Executor {
@@ -1872,7 +1843,7 @@ public abstract class BaseExecutor implements Executor {
 
 #### SimpleExecutor
 
-具体的SQL执行逻辑交给执行器的实现类完成。
+模板模式，子类只需要重写部分方法就能修改具体的执行逻辑。
 
 ```java
 public class SimpleExecutor extends BaseExecutor {
@@ -1899,7 +1870,9 @@ public class SimpleExecutor extends BaseExecutor {
 
 ### 语句处理器
 
-SQL中，是由`java.sql.Statement`实例来通过`execute(String sql)`来执行SQL语句的。因此，将实例化Statement对象、参数处理和具体执行都做出规范化约束，提取到`StatementHandler`中。然后，将通用的逻辑交给`BaseStatementHandler`来实现。其余的具体逻辑放在实现类实现。
+我们使用Mybatis时，将SQL定义在Mapper XML文件中。前面我们已经通过解析XML文件将SQL的相关信息都封装在MappedStatement对象中，将SQL语句的参数名、入参类型、返回值类型等存储在BoundSql中。
+
+JDBC操作数据库时，需要通过Statement对象来进行。那么，使用我们封装好的BoundSql对象来申请Statement对象，并给SQL传入参数等准备工作，也可以抽象出来一个接口，即为`StatemenHandler`。
 
 #### StatementHandler
 
@@ -1920,7 +1893,7 @@ public interface StatementHandler {
 
 #### BaseStatementHandler
 
-这是一个抽象类，对准备Statement需要用到的引用和共有逻辑做出实现。
+这是一个抽象类，对准备Statement需要用到的引用和共有逻辑做出实现。即模板模式，根据需求实现子类即可修改具体逻辑。
 
 ```java
 public abstract class BaseStatementHandler implements StatementHandler {
@@ -1963,6 +1936,8 @@ public abstract class BaseStatementHandler implements StatementHandler {
 ```
 
 #### PreparedStatementHandler
+
+对Statement接口的实现类`PreparedStatement`对象进行处理的工具类。
 
 ```java
 public class PreparedStatementHandler extends BaseStatementHandler{
@@ -2073,6 +2048,466 @@ public class DefaultSqlSession implements SqlSession {
 本章节的做法是，根据需要反射填充的对象`originalObject`生成一个元对象`MetaObject`。在元对象中进行拆解解析，将对象所属的类，对象的属性字段，对象的方法都拆解出来。
 
 然后，在XMLConfigBuilder解析`<environment>`标签时，根据读取出来的属性字段，利用元对象，将这些字段填充进dataSource对象中。这样就不需要在DataSource类中以硬编码的方式定义这些属性值。后期即便有新的字段出现，只需要在XML文件中给出，就能够自动填充进对象中。
+
+### 类型解析
+
+如果我们想要对于一个类clazz，通过反射的方式访问其内部的属性和方法，就需要先将内部可以访问的方法和属性都解析出来。
+
+#### Reflector
+
+给定一个类的Class对象，Reflector会对其进行解析，将所有可以访问的属性以及其getter/setter都抽取出来，分别为维护在一个Map集合中。并且还会保存其名称和类别的映射关系。另外，对于外界能访问，但是又没有提供getter和setter方法的属性，也为其提供类似getter和setter的功能，方便通过反射读取或设置值。
+
+##### `addGetMethods()`
+
+首先，将该类所有定义的方法、从父类继承的方法、实现接口的方法，统统拿到一个`Method[]`数组中(如果子类重写了父类的方法，就只保留子类中的方法，即会覆盖)。然后，对于每一个方法Method，都检查其方法名：如果以get/is开头，且长度大于3/2，并且无入参，证明当前方法是一个成员变量的getter。则将方法对应的成员变量名name取出，对每个成员变量，都维护一个`List<Method>`集合，保存其对应的getter和is方法。将所有的方法都解析后，就会得到一个Map集合`Map<String, List<Method>`，即可以通过属性名来获取其对应的getter和is方法。
+
+接着，上面得到的Map集合中，一个属性可能对应了多个getter和is，需要消除歧义。如定了多个getter就需要抛出异常；如果是继承的来的getter就找到最后一次子类中重写的getter。
+
+对于一个属性，其对应的getter消除歧义完成了，就会获得唯一的getter，此时将属性和对应的getter的调用方法加入到`getMethods<String, MethodInvoker>`集合中。将getter方法的返回值类型记录到`getTypes<String, Class<?>>`集合中。
+
+##### `addSetMethods()`
+
+其逻辑和上述的`addGetMethods()`是一致的，先得到保存属性名和对应的setter的Map集合，然后消除歧义，将属性名和setter封装进`setMethods<String, MethodIvoker>`，将setter的入参类型记录到`setTypes<String, Class<?>>`中。其实就是变相记录了属性的类型。
+
+##### `addFields()`
+
+前面已经对类中getter和setter做出了解析，就可以知道哪些属性可以读取，哪些属性可以写入。对于剩余的属性，如果它们可以被外界访问，但是又没有提供getter和setter，我们就要将其加入可访问的属性集合中。如将属性名和对应的get调用方法封装到`getMethods`集合中，将不是`static`和`final`修饰的属性加入到`setMethods`中。
+
+```java 
+public class Reflector {
+
+    private static boolean classCacheEnabled = true;
+
+    private static final String[] EMPTY_STRING_ARRAY = new String[0];
+    // 线程安全的缓存
+    private static final Map<Class<?>, Reflector> REFLECTOR_MAP = new ConcurrentHashMap<>();
+
+    private Class<?> type;
+    // get 属性列表
+    private String[] readablePropertyNames = EMPTY_STRING_ARRAY;
+    // set 属性列表
+    private String[] writeablePropertyNames = EMPTY_STRING_ARRAY;
+    // set 方法列表
+    private Map<String, Invoker> setMethods = new HashMap<>();
+    // get 方法列表
+    private Map<String, Invoker> getMethods = new HashMap<>();
+    // set 类型列表
+    private Map<String, Class<?>> setTypes = new HashMap<>();
+    // get 类型列表
+    private Map<String, Class<?>> getTypes = new HashMap<>();
+    // 构造函数
+    private Constructor<?> defaultConstructor;
+
+    private Map<String, String> caseInsensitivePropertyMap = new HashMap<>();
+
+    public Reflector(Class<?> clazz) {
+        this.type = clazz;
+        // 加入构造函数
+        addDefaultConstructor(clazz);
+        // 加入 getter
+        addGetMethods(clazz);
+        // 加入 setter
+        addSetMethods(clazz);
+        // 加入字段
+        addFields(clazz);
+        readablePropertyNames = getMethods.keySet().toArray(new String[getMethods.keySet().size()]);
+        writeablePropertyNames = setMethods.keySet().toArray(new String[setMethods.keySet().size()]);
+        for (String propName : readablePropertyNames) {
+            caseInsensitivePropertyMap.put(propName.toUpperCase(Locale.ENGLISH), propName);
+        }
+        for (String propName : writeablePropertyNames) {
+            caseInsensitivePropertyMap.put(propName.toUpperCase(Locale.ENGLISH), propName);
+        }
+    }
+
+    private void addDefaultConstructor(Class<?> clazz) {
+        Constructor<?>[] consts = clazz.getDeclaredConstructors();
+        for (Constructor<?> constructor : consts) {
+            if (constructor.getParameterTypes().length == 0) {
+                if (canAccessPrivateMethods()) {
+                    try {
+                        constructor.setAccessible(true);
+                    } catch (Exception ignore) {
+                        // Ignored. This is only a final precaution, nothing we can do
+                    }
+                }
+                if (constructor.isAccessible()) {
+                    this.defaultConstructor = constructor;
+                }
+            }
+        }
+    }
+
+    private void addGetMethods(Class<?> clazz) {
+        Map<String, List<Method>> conflictingGetters = new HashMap<>();
+        Method[] methods = getClassMethods(clazz);
+        for (Method method : methods) {
+            String name = method.getName();
+            if (name.startsWith("get") && name.length() > 3) {
+                if (method.getParameterTypes().length == 0) {
+                    name = PropertyNamer.methodToProperty(name);
+                    addMethodConflict(conflictingGetters, name, method);
+                }
+            } else if (name.startsWith("is") && name.length() > 2) {
+                if (method.getParameterTypes().length == 0) {
+                    name = PropertyNamer.methodToProperty(name);
+                    addMethodConflict(conflictingGetters, name, method);
+                }
+            }
+        }
+        resolveGetterConflicts(conflictingGetters);
+    }
+
+    private void addSetMethods(Class<?> clazz) {
+        Map<String, List<Method>> conflictingSetters = new HashMap<>();
+        Method[] methods = getClassMethods(clazz);
+        for (Method method : methods) {
+            String name = method.getName();
+            if (name.startsWith("set") && name.length() > 3) {
+                if (method.getParameterTypes().length == 1) {
+                    name = PropertyNamer.methodToProperty(name);
+                    addMethodConflict(conflictingSetters, name, method);
+                }
+            }
+        }
+        resolveSetterConflicts(conflictingSetters);
+    }
+
+    private void resolveSetterConflicts(Map<String, List<Method>> conflictingSetters) {
+        for (String propName : conflictingSetters.keySet()) {
+            List<Method> setters = conflictingSetters.get(propName);
+            Method firstMethod = setters.get(0);
+            if (setters.size() == 1) {
+                addSetMethod(propName, firstMethod);
+            } else {
+                Class<?> expectedType = getTypes.get(propName);
+                if (expectedType == null) {
+                    throw new RuntimeException("Illegal overloaded setter method with ambiguous type for property "
+                            + propName + " in class " + firstMethod.getDeclaringClass() + ".  This breaks the JavaBeans " +
+                            "specification and can cause unpredicatble results.");
+                } else {
+                    Iterator<Method> methods = setters.iterator();
+                    Method setter = null;
+                    while (methods.hasNext()) {
+                        Method method = methods.next();
+                        if (method.getParameterTypes().length == 1
+                                && expectedType.equals(method.getParameterTypes()[0])) {
+                            setter = method;
+                            break;
+                        }
+                    }
+                    if (setter == null) {
+                        throw new RuntimeException("Illegal overloaded setter method with ambiguous type for property "
+                                + propName + " in class " + firstMethod.getDeclaringClass() + ".  This breaks the JavaBeans " +
+                                "specification and can cause unpredicatble results.");
+                    }
+                    addSetMethod(propName, setter);
+                }
+            }
+        }
+    }
+
+    private void addSetMethod(String name, Method method) {
+        if (isValidPropertyName(name)) {
+            setMethods.put(name, new MethodInvoker(method));
+            setTypes.put(name, method.getParameterTypes()[0]);
+        }
+    }
+
+    private void addFields(Class<?> clazz) {
+        Field[] fields = clazz.getDeclaredFields();
+        for (Field field : fields) {
+            if (canAccessPrivateMethods()) {
+                try {
+                    field.setAccessible(true);
+                } catch (Exception e) {
+                    // Ignored. This is only a final precaution, nothing we can do.
+                }
+            }
+            if (field.isAccessible()) {
+                if (!setMethods.containsKey(field.getName())) {
+                    // issue #379 - removed the check for final because JDK 1.5 allows
+                    // modification of final fields through reflection (JSR-133). (JGB)
+                    // pr #16 - final static can only be set by the classloader
+                    int modifiers = field.getModifiers();
+                    if (!(Modifier.isFinal(modifiers) && Modifier.isStatic(modifiers))) {
+                        addSetField(field);
+                    }
+                }
+                if (!getMethods.containsKey(field.getName())) {
+                    addGetField(field);
+                }
+            }
+        }
+        if (clazz.getSuperclass() != null) {
+            addFields(clazz.getSuperclass());
+        }
+    }
+
+    private void addSetField(Field field) {
+        if (isValidPropertyName(field.getName())) {
+            setMethods.put(field.getName(), new SetFieldInvoker(field));
+            setTypes.put(field.getName(), field.getType());
+        }
+    }
+
+    private void addGetField(Field field) {
+        if (isValidPropertyName(field.getName())) {
+            getMethods.put(field.getName(), new GetFieldInvoker(field));
+            getTypes.put(field.getName(), field.getType());
+        }
+    }
+
+    private void resolveGetterConflicts(Map<String, List<Method>> conflictingGetters) {
+        for (String propName : conflictingGetters.keySet()) {
+            List<Method> getters = conflictingGetters.get(propName);
+            Iterator<Method> iterator = getters.iterator();
+            Method firstMethod = iterator.next();
+            if (getters.size() == 1) {
+                addGetMethod(propName, firstMethod);
+            } else {
+                Method getter = firstMethod;
+                Class<?> getterType = firstMethod.getReturnType();
+                while (iterator.hasNext()) {
+                    Method method = iterator.next();
+                    Class<?> methodType = method.getReturnType();
+                    if (methodType.equals(getterType)) {
+                        throw new RuntimeException("Illegal overloaded getter method with ambiguous type for property "
+                                + propName + " in class " + firstMethod.getDeclaringClass()
+                                + ".  This breaks the JavaBeans " + "specification and can cause unpredicatble results.");
+                    } else if (methodType.isAssignableFrom(getterType)) {
+                        // OK getter type is descendant
+                    } else if (getterType.isAssignableFrom(methodType)) {
+                        getter = method;
+                        getterType = methodType;
+                    } else {
+                        throw new RuntimeException("Illegal overloaded getter method with ambiguous type for property "
+                                + propName + " in class " + firstMethod.getDeclaringClass()
+                                + ".  This breaks the JavaBeans " + "specification and can cause unpredicatble results.");
+                    }
+                }
+                addGetMethod(propName, getter);
+            }
+        }
+    }
+
+    private void addGetMethod(String name, Method method) {
+        if (isValidPropertyName(name)) {
+            getMethods.put(name, new MethodInvoker(method));
+            getTypes.put(name, method.getReturnType());
+        }
+    }
+
+    private boolean isValidPropertyName(String name) {
+        return !(name.startsWith("$") || "serialVersionUID".equals(name) || "class".equals(name));
+    }
+
+    private void addMethodConflict(Map<String, List<Method>> conflictingMethods, String name, Method method) {
+        List<Method> list = conflictingMethods.computeIfAbsent(name, k -> new ArrayList<>());
+        list.add(method);
+    }
+
+    private Method[] getClassMethods(Class<?> cls) {
+        Map<String, Method> uniqueMethods = new HashMap<String, Method>();
+        Class<?> currentClass = cls;
+        while (currentClass != null) {
+            addUniqueMethods(uniqueMethods, currentClass.getDeclaredMethods());
+
+            // we also need to look for interface methods -
+            // because the class may be abstract
+            Class<?>[] interfaces = currentClass.getInterfaces();
+            for (Class<?> anInterface : interfaces) {
+                addUniqueMethods(uniqueMethods, anInterface.getMethods());
+            }
+
+            currentClass = currentClass.getSuperclass();
+        }
+
+        Collection<Method> methods = uniqueMethods.values();
+
+        return methods.toArray(new Method[methods.size()]);
+    }
+
+    private void addUniqueMethods(Map<String, Method> uniqueMethods, Method[] methods) {
+        for (Method currentMethod : methods) {
+            if (!currentMethod.isBridge()) {
+                //取得签名 "ReturnType#methodName:param1,param2
+                String signature = getSignature(currentMethod);
+                // check to see if the method is already known
+                // if it is known, then an extended class must have
+                // overridden a method
+                if (!uniqueMethods.containsKey(signature)) {
+                    if (canAccessPrivateMethods()) {
+                        try {
+                            currentMethod.setAccessible(true);
+                        } catch (Exception e) {
+                            // Ignored. This is only a final precaution, nothing we can do.
+                        }
+                    }
+
+                    uniqueMethods.put(signature, currentMethod);
+                }
+            }
+        }
+    }
+
+    private String getSignature(Method method) {
+        StringBuilder sb = new StringBuilder();
+        Class<?> returnType = method.getReturnType();
+        if (returnType != null) {
+            sb.append(returnType.getName()).append('#');
+        }
+        sb.append(method.getName());
+        Class<?>[] parameters = method.getParameterTypes();
+        for (int i = 0; i < parameters.length; i++) {
+            if (i == 0) {
+                sb.append(':');
+            } else {
+                sb.append(',');
+            }
+            sb.append(parameters[i].getName());
+        }
+        return sb.toString();
+    }
+
+    private static boolean canAccessPrivateMethods() {
+        try {
+            SecurityManager securityManager = System.getSecurityManager();
+            if (null != securityManager) {
+                securityManager.checkPermission(new ReflectPermission("suppressAccessChecks"));
+            }
+        } catch (SecurityException e) {
+            return false;
+        }
+        return true;
+    }
+
+    public Class<?> getType() {
+        return type;
+    }
+
+    public Constructor<?> getDefaultConstructor() {
+        if (defaultConstructor != null) {
+            return defaultConstructor;
+        } else {
+            throw new RuntimeException("There is no default constructor for " + type);
+        }
+    }
+
+    public boolean hasDefaultConstructor() {
+        return defaultConstructor != null;
+    }
+
+    public Class<?> getSetterType(String propertyName) {
+        Class<?> clazz = setTypes.get(propertyName);
+        if (clazz == null) {
+            throw new RuntimeException("There is no setter for property named '" + propertyName + "' in '" + type + "'");
+        }
+        return clazz;
+    }
+
+    public Invoker getGetInvoker(String propertyName) {
+        Invoker method = getMethods.get(propertyName);
+        if (method == null) {
+            throw new RuntimeException("There is no getter for property named '" + propertyName + "' in '" + type + "'");
+        }
+        return method;
+    }
+
+    public Invoker getSetInvoker(String propertyName) {
+        Invoker method = setMethods.get(propertyName);
+        if (method == null) {
+            throw new RuntimeException("There is no setter for property named '" + propertyName + "' in '" + type + "'");
+        }
+        return method;
+    }
+    /*
+     * Gets the type for a property getter
+     *
+     * @param propertyName - the name of the property
+     * @return The Class of the propery getter
+     */
+    public Class<?> getGetterType(String propertyName) {
+        Class<?> clazz = getTypes.get(propertyName);
+        if (clazz == null) {
+            throw new RuntimeException("There is no getter for property named '" + propertyName + "' in '" + type + "'");
+        }
+        return clazz;
+    }
+    /*
+     * Gets an array of the readable properties for an object
+     *
+     * @return The array
+     */
+    public String[] getGetablePropertyNames() {
+        return readablePropertyNames;
+    }
+    /*
+     * Gets an array of the writeable properties for an object
+     *
+     * @return The array
+     */
+    public String[] getSetablePropertyNames() {
+        return writeablePropertyNames;
+    }
+    /*
+     * Check to see if a class has a writeable property by name
+     *
+     * @param propertyName - the name of the property to check
+     * @return True if the object has a writeable property by the name
+     */
+    public boolean hasSetter(String propertyName) {
+        return setMethods.keySet().contains(propertyName);
+    }
+
+    /*
+     * Check to see if a class has a readable property by name
+     *
+     * @param propertyName - the name of the property to check
+     * @return True if the object has a readable property by the name
+     */
+    public boolean hasGetter(String propertyName) {
+        return getMethods.keySet().contains(propertyName);
+    }
+
+    public String findPropertyName(String name) {
+        return caseInsensitivePropertyMap.get(name.toUpperCase(Locale.ENGLISH));
+    }
+
+    /*
+     * Gets an instance of ClassInfo for the specified class.
+     * 得到某个类的反射器，是静态方法，而且要缓存，又要多线程，所以REFLECTOR_MAP是一个ConcurrentHashMap
+     *
+     * @param clazz The class for which to lookup the method cache.
+     * @return The method cache for the class
+     */
+    public static Reflector forClass(Class<?> clazz) {
+        if (classCacheEnabled) {
+            // synchronized (clazz) removed see issue #461
+            // 对于每个类来说，我们假设它是不会变的，这样可以考虑将这个类的信息(构造函数，getter,setter,字段)加入缓存，以提高速度
+            Reflector cached = REFLECTOR_MAP.get(clazz);
+            if (cached == null) {
+                cached = new Reflector(clazz);
+                REFLECTOR_MAP.put(clazz, cached);
+            }
+            return cached;
+        } else {
+            return new Reflector(clazz);
+        }
+    }
+
+    public static void setClassCacheEnabled(boolean classCacheEnabled) {
+        Reflector.classCacheEnabled = classCacheEnabled;
+    }
+
+    public static boolean isClassCacheEnabled() {
+        return classCacheEnabled;
+    }
+}
+```
+
+
+
 
 
 ## 第八章 细化XML语句构造器，完善静态SQL解析
